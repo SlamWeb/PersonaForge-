@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personaforge"
+version = "0.1.0"
+description = "Local-first creator persona RAG."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "PersonaForge Contributors" }
+]
+dependencies = [
+  "beautifulsoup4>=4.12",
+]
+
+[project.optional-dependencies]
+crawler = [
+  "playwright>=1.45",
+]
+index = [
+  "FlagEmbedding>=1.2.10",
+  "qdrant-client>=1.10",
+]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+pf = "personaforge.cli:main"
+personaforge = "personaforge.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

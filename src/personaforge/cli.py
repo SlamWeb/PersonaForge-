@@ -1,0 +1,671 @@
+"""Command line entrypoint for PersonaForge."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Iterable
+
+from personaforge import __version__
+from personaforge.crawler.exceptions import CrawlError
+from personaforge.crawler.markdown import write_markdown_corpus, write_profile
+from personaforge.crawler.models import ContentItem, ContentKind, CreatorProfile
+from personaforge.crawler.zhihu import ZhihuPublicCrawler, fallback_profile, parse_user_token
+from personaforge.crawler.zhihu_browser import ZhihuBrowserCrawler, save_zhihu_session
+from personaforge.ingest.embeddings import BgeM3Encoder
+from personaforge.ingest.build import build_corpus
+from personaforge.ingest.index import index_corpus
+from personaforge.ingest.query_understanding import build_grounded_query_plan, plan_to_trace
+from personaforge.ingest.retrieve import retrieve_parents, retrieve_parents_for_queries
+from personaforge.llm import DeepSeekJsonClient
+from personaforge.persona.writer import WRITER_PROMPT_CHOICES, build_prompt_pack, generate_answer
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pf",
+        description="PersonaForge: local-first creator persona RAG.",
+    )
+    parser.add_argument("--version", action="version", version=f"personaforge {__version__}")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    init_parser = subparsers.add_parser("init", help="Create local data directories.")
+    init_parser.add_argument("--data-dir", default="data", help="Local data root.")
+
+    crawl_parser = subparsers.add_parser("crawl", help="Crawl a creator into local Markdown.")
+    crawl_parser.add_argument("platform", choices=["zhihu"], help="Content platform.")
+    crawl_parser.add_argument("author", help="Creator token or username.")
+    crawl_parser.add_argument("--out-dir", help="Output raw Markdown directory.")
+    crawl_parser.add_argument("--all", action="store_true", help="Crawl all reachable items.")
+    crawl_parser.add_argument("--max-items", type=int, default=100, help="Maximum items to save unless --all is set.")
+    crawl_parser.add_argument(
+        "--kind",
+        action="append",
+        choices=["answer", "article", "pin"],
+        help="Content kind to crawl. Can be repeated. Defaults to answer/article/pin.",
+    )
+    crawl_parser.add_argument("--delay-seconds", type=float, default=1.5, help="Delay between requests/scrolls.")
+    crawl_parser.add_argument("--max-api-pages", type=int, default=10, help="Maximum API pages per kind.")
+    crawl_parser.add_argument(
+        "--storage-state",
+        type=Path,
+        help="Optional Playwright storage_state JSON for logged-in fallback.",
+    )
+    crawl_parser.add_argument("--headed", action="store_true", help="Open a visible browser for fallback crawling.")
+    crawl_parser.add_argument("--no-api", action="store_true", help="Skip API strategies and use browser page crawling.")
+    crawl_parser.add_argument("--no-browser", action="store_true", help="Do not use Playwright fallback.")
+    crawl_parser.add_argument("--quiet", action="store_true", help="Hide crawl progress messages.")
+
+    login_parser = subparsers.add_parser("zhihu-login", help="Save a local Zhihu browser login state.")
+    login_parser.add_argument(
+        "--storage-state",
+        type=Path,
+        default=Path("data/auth/zhihu_storage_state.json"),
+        help="Where to save Playwright storage_state JSON.",
+    )
+    login_parser.add_argument("--timeout-seconds", type=float, default=300.0)
+
+    build_index_parser = subparsers.add_parser("build", help="Build a local index from Markdown.")
+    build_index_parser.add_argument("author", nargs="?", help="Creator token.")
+    build_index_parser.add_argument("--raw-dir", help="Existing raw Markdown directory.")
+    build_index_parser.add_argument("--index-dir", help="Output index directory.")
+    build_index_parser.add_argument(
+        "--quality",
+        choices=["fast", "full"],
+        default="fast",
+        help="Build quality. fast avoids LLM preprocessing.",
+    )
+
+    index_parser = subparsers.add_parser("index", help="Embed nodes and write a local Qdrant collection.")
+    index_parser.add_argument("author", help="Creator token.")
+    index_parser.add_argument("--index-dir", help="Directory containing nodes.jsonl.")
+    index_parser.add_argument("--qdrant-path", help="Local Qdrant storage path.")
+    index_parser.add_argument("--model-name", default="BAAI/bge-m3", help="Embedding model name.")
+    index_parser.add_argument(
+        "--embedding-device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device for BGE-M3 embedding.",
+    )
+    index_parser.add_argument("--batch-size", type=int, default=12, help="Embedding batch size.")
+    index_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
+
+    retrieve_parser = subparsers.add_parser("retrieve", help="Run retrieval against a local Qdrant index.")
+    retrieve_parser.add_argument("author", help="Creator token.")
+    retrieve_parser.add_argument("query", help="User query.")
+    retrieve_parser.add_argument("--index-dir", help="Directory containing parents.jsonl and nodes.jsonl.")
+    retrieve_parser.add_argument("--qdrant-path", help="Local Qdrant storage path.")
+    retrieve_parser.add_argument("--model-name", default="BAAI/bge-m3", help="Embedding model name.")
+    retrieve_parser.add_argument(
+        "--embedding-device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device for query embedding.",
+    )
+    retrieve_parser.add_argument("--child-top-k", type=int, default=100)
+    retrieve_parser.add_argument("--per-query-parent-k", type=int, default=30)
+    retrieve_parser.add_argument("--parent-top-k", type=int, default=20)
+    retrieve_parser.add_argument(
+        "--query-mode",
+        choices=["raw", "grounded"],
+        default="raw",
+        help="raw uses the original query only; grounded runs search planning, optional Tavily, and 4-way query transform.",
+    )
+    retrieve_parser.add_argument("--max-search-results", type=int, default=5)
+    retrieve_parser.add_argument("--trace-path", help="Optional JSON file for query understanding and retrieval trace.")
+    retrieve_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
+
+    ask_parser = subparsers.add_parser("ask", help="Retrieve context and generate a persona-style answer.")
+    ask_parser.add_argument("author", help="Creator token.")
+    ask_parser.add_argument("query", help="User query.")
+    ask_parser.add_argument("--index-dir", help="Directory containing parents.jsonl and nodes.jsonl.")
+    ask_parser.add_argument("--qdrant-path", help="Local Qdrant storage path.")
+    ask_parser.add_argument("--model-name", default="BAAI/bge-m3", help="Embedding model name.")
+    ask_parser.add_argument(
+        "--embedding-device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device for query embedding.",
+    )
+    ask_parser.add_argument("--child-top-k", type=int, default=100)
+    ask_parser.add_argument("--per-query-parent-k", type=int, default=30)
+    ask_parser.add_argument("--parent-top-k", type=int, default=20)
+    ask_parser.add_argument(
+        "--query-mode",
+        choices=["raw", "grounded"],
+        default="grounded",
+        help="grounded runs search planning, optional Tavily, and 4-way query transform before generation.",
+    )
+    ask_parser.add_argument("--max-search-results", type=int, default=5)
+    ask_parser.add_argument("--temperature", type=float, default=0.85)
+    ask_parser.add_argument("--max-tokens", type=int, default=1600)
+    ask_parser.add_argument(
+        "--writer-prompt",
+        choices=WRITER_PROMPT_CHOICES,
+        default="current",
+        help="Writer prompt variant. current keeps the tuned anti-AI prompt; strong_identity tests a generic identity-immersion prompt.",
+    )
+    ask_parser.add_argument("--trace-path", help="Optional JSON file for query, retrieval, and answer trace.")
+    ask_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
+
+    prompt_pack_parser = subparsers.add_parser(
+        "prompt-pack",
+        help="Retrieve context and export a pasteable ChatGPT prompt pack without calling the writer LLM.",
+    )
+    prompt_pack_parser.add_argument("author", help="Creator token.")
+    prompt_pack_parser.add_argument("query", help="User query.")
+    prompt_pack_parser.add_argument("--index-dir", help="Directory containing parents.jsonl and nodes.jsonl.")
+    prompt_pack_parser.add_argument("--qdrant-path", help="Local Qdrant storage path.")
+    prompt_pack_parser.add_argument("--model-name", default="BAAI/bge-m3", help="Embedding model name.")
+    prompt_pack_parser.add_argument(
+        "--embedding-device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device for query embedding.",
+    )
+    prompt_pack_parser.add_argument("--child-top-k", type=int, default=100)
+    prompt_pack_parser.add_argument("--per-query-parent-k", type=int, default=30)
+    prompt_pack_parser.add_argument("--parent-top-k", type=int, default=20)
+    prompt_pack_parser.add_argument(
+        "--query-mode",
+        choices=["raw", "grounded"],
+        default="grounded",
+        help="grounded runs search planning, optional Tavily, and 4-way query transform before prompt export.",
+    )
+    prompt_pack_parser.add_argument("--max-search-results", type=int, default=5)
+    prompt_pack_parser.add_argument(
+        "--writer-prompt",
+        choices=WRITER_PROMPT_CHOICES,
+        default="strong_identity",
+        help="Writer prompt variant to export.",
+    )
+    prompt_pack_parser.add_argument("--out", help="Output Markdown file. Prints to stdout when omitted.")
+    prompt_pack_parser.add_argument("--trace-path", help="Optional JSON file for query and retrieval trace.")
+    prompt_pack_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
+
+    web_parser = subparsers.add_parser("web", help="Start the local Web UI.")
+    web_parser.add_argument("author", nargs="?", help="Creator token.")
+    web_parser.add_argument("--port", type=int, default=8000)
+
+    forge_parser = subparsers.add_parser("forge", help="Crawl, build, and start the local Web UI.")
+    forge_parser.add_argument("platform", choices=["zhihu"])
+    forge_parser.add_argument("author")
+    forge_parser.add_argument("--quality", choices=["fast", "full"], default="fast")
+    forge_parser.add_argument("--port", type=int, default=8000)
+
+    return parser
+
+
+def _ensure_data_dirs(data_dir: Path) -> list[Path]:
+    paths = [
+        data_dir / "authors",
+        data_dir / "raw",
+        data_dir / "index",
+        data_dir / "auth",
+        data_dir / "models",
+        data_dir / "eval",
+    ]
+    for path in paths:
+        path.mkdir(parents=True, exist_ok=True)
+    return paths
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "init":
+        paths = _ensure_data_dirs(Path(args.data_dir))
+        print("Created local data directories:")
+        for path in paths:
+            print(f"- {path}")
+        return 0
+
+    if args.command == "crawl":
+        return _run_crawl(args)
+
+    if args.command == "zhihu-login":
+        return _run_zhihu_login(args)
+
+    if args.command == "build":
+        return _run_build(args)
+
+    if args.command == "index":
+        return _run_index(args)
+
+    if args.command == "retrieve":
+        return _run_retrieve(args)
+
+    if args.command == "ask":
+        return _run_ask(args)
+
+    if args.command == "prompt-pack":
+        return _run_prompt_pack(args)
+
+    if args.command in {"web", "forge"}:
+        parser.error(f"`pf {args.command}` is specified but not implemented yet.")
+
+    parser.print_help()
+    return 0
+
+
+def _run_crawl(args: argparse.Namespace) -> int:
+    if args.platform != "zhihu":
+        raise ValueError(f"Unsupported platform: {args.platform}")
+
+    token = parse_user_token(args.author)
+    out_dir = Path(args.out_dir) if args.out_dir else Path("data/authors") / "zhihu" / token / "raw"
+    kinds = tuple(args.kind or ("answer", "article", "pin"))
+    max_items = None if args.all else args.max_items
+    progress = None if args.quiet else print
+
+    profile: CreatorProfile | None = None
+    items: list[ContentItem] = []
+    errors: list[str] = []
+
+    if not args.no_api:
+        public = ZhihuPublicCrawler(
+            delay_seconds=args.delay_seconds,
+            max_api_pages=args.max_api_pages,
+            progress=progress,
+        )
+        try:
+            profile = public.crawl_profile(token)
+        except CrawlError as exc:
+            errors.append(f"public profile: {exc}")
+        try:
+            items.extend(public.crawl_user(token, kinds=_content_kinds(kinds), max_items=max_items))
+        except CrawlError as exc:
+            errors.append(f"public crawl: {exc}")
+
+    if not items and not args.no_browser:
+        browser = ZhihuBrowserCrawler(
+            headless=not args.headed,
+            storage_state=args.storage_state,
+            delay_seconds=args.delay_seconds,
+            use_api=not args.no_api,
+            max_api_pages=args.max_api_pages,
+            progress=progress,
+        )
+        try:
+            profile = profile or browser.crawl_profile(token)
+        except CrawlError as exc:
+            errors.append(f"browser profile: {exc}")
+        try:
+            items.extend(browser.crawl_user(token, kinds=_content_kinds(kinds), max_items=max_items))
+        except CrawlError as exc:
+            errors.append(f"browser crawl: {exc}")
+
+    if not items:
+        print("No items were crawled.")
+        if errors:
+            print("Attempts:")
+            for error in errors:
+                print(f"- {error}")
+        print("If the public route is blocked, run:")
+        print("  pf zhihu-login --storage-state data/auth/zhihu_storage_state.json")
+        print(
+            "Then retry with "
+            "--storage-state data/auth/zhihu_storage_state.json "
+            "(use --headed if you want to see the fallback browser)."
+        )
+        return 2
+
+    profile = profile or fallback_profile(token)
+    write_profile(profile, out_dir)
+    paths = write_markdown_corpus(items, out_dir)
+
+    print(f"Saved {len(paths)} item(s) to {out_dir}")
+    print(f"Profile: {out_dir / 'profile.json'}")
+    print(f"Manifest: {out_dir / 'manifest.jsonl'}")
+    return 0
+
+
+def _run_zhihu_login(args: argparse.Namespace) -> int:
+    save_zhihu_session(args.storage_state, timeout_seconds=args.timeout_seconds)
+    print(f"Saved Zhihu storage state to {args.storage_state}")
+    return 0
+
+
+def _run_build(args: argparse.Namespace) -> int:
+    if not args.author and not args.raw_dir:
+        raise ValueError("`pf build` needs an author token or --raw-dir.")
+
+    author = args.author or Path(args.raw_dir).name
+    raw_dir = Path(args.raw_dir) if args.raw_dir else Path("data/authors") / "zhihu" / author / "raw"
+    index_dir = Path(args.index_dir) if args.index_dir else Path("data/authors") / "zhihu" / author / "index"
+
+    result = build_corpus(raw_dir, index_dir, quality=args.quality)
+
+    print(f"Built ingest artifacts for {author}:")
+    print(f"- parents: {result.parent_count} -> {result.parents_path}")
+    print(f"- nodes: {result.node_count} -> {result.nodes_path}")
+    print(f"- manifest: {result.manifest_path}")
+    return 0
+
+
+def _run_index(args: argparse.Namespace) -> int:
+    index_dir = Path(args.index_dir) if args.index_dir else Path("data/authors") / "zhihu" / args.author / "index"
+    qdrant_path = Path(args.qdrant_path) if args.qdrant_path else index_dir / "qdrant"
+    encoder = BgeM3Encoder(
+        args.model_name,
+        device=args.embedding_device,
+        use_fp16=not args.no_fp16,
+    )
+    result = index_corpus(
+        index_dir,
+        author=args.author,
+        qdrant_path=qdrant_path,
+        encoder=encoder,
+        batch_size=args.batch_size,
+    )
+
+    print(f"Indexed {result.node_count} node(s) for {args.author}:")
+    print(f"- collection: {result.collection_name}")
+    print(f"- dense size: {result.dense_size}")
+    print(f"- qdrant: {result.qdrant_path}")
+    print(f"- manifest: {result.manifest_path}")
+    return 0
+
+
+def _run_retrieve(args: argparse.Namespace) -> int:
+    index_dir = Path(args.index_dir) if args.index_dir else Path("data/authors") / "zhihu" / args.author / "index"
+    qdrant_path = Path(args.qdrant_path) if args.qdrant_path else index_dir / "qdrant"
+    encoder = BgeM3Encoder(
+        args.model_name,
+        device=args.embedding_device,
+        use_fp16=not args.no_fp16,
+    )
+    query_trace = None
+    if args.query_mode == "grounded":
+        llm = DeepSeekJsonClient.from_env()
+        plan = build_grounded_query_plan(
+            args.query,
+            llm=llm,
+            max_results_per_query=args.max_search_results,
+        )
+        query_trace = plan_to_trace(plan)
+        result = retrieve_parents_for_queries(
+            args.query,
+            plan.transform.retrieval_queries,
+            author=args.author,
+            index_dir=index_dir,
+            qdrant_path=qdrant_path,
+            encoder=encoder,
+            child_top_k=args.child_top_k,
+            per_query_parent_k=args.per_query_parent_k,
+            parent_top_k=args.parent_top_k,
+        )
+        print(f"Needs web: {plan.search_plan.needs_web}")
+        if plan.search_plan.search_queries:
+            print("Search queries:")
+            for item in plan.search_plan.search_queries:
+                print(f"- {item}")
+        if plan.transform.objective_background:
+            print(f"Objective background: {plan.transform.objective_background}")
+        print("Retrieval queries:")
+        for item in plan.transform.retrieval_queries:
+            print(f"- {item.route}: {item.query}")
+    else:
+        result = retrieve_parents(
+            args.query,
+            author=args.author,
+            index_dir=index_dir,
+            qdrant_path=qdrant_path,
+            encoder=encoder,
+            child_top_k=args.child_top_k,
+            parent_top_k=args.parent_top_k,
+        )
+
+    if args.trace_path:
+        _write_retrieve_trace(Path(args.trace_path), query_trace=query_trace, result=result)
+
+    print(f"Query: {result.query}")
+    print(f"Collection: {result.collection_name}")
+    print("Top parents:")
+    for hit in result.parents:
+        routes = ", ".join(
+            f"{child.route}#{child.rank}:{child.node_type}:{child.score:.4f}"
+            for child in hit.first_hits
+        )
+        print(f"{hit.rank}. {hit.parent_id} | {hit.score:.6f} | {hit.title}")
+        print(f"   path: {hit.path}")
+        print(f"   first hits: {routes}")
+    return 0
+
+
+def _retrieve_for_generation(args: argparse.Namespace):
+    index_dir = Path(args.index_dir) if args.index_dir else Path("data/authors") / "zhihu" / args.author / "index"
+    qdrant_path = Path(args.qdrant_path) if args.qdrant_path else index_dir / "qdrant"
+    encoder = BgeM3Encoder(
+        args.model_name,
+        device=args.embedding_device,
+        use_fp16=not args.no_fp16,
+    )
+    query_trace = None
+    objective_background = ""
+
+    if args.query_mode == "grounded":
+        llm = DeepSeekJsonClient.from_env()
+        plan = build_grounded_query_plan(
+            args.query,
+            llm=llm,
+            max_results_per_query=args.max_search_results,
+        )
+        query_trace = plan_to_trace(plan)
+        objective_background = plan.transform.objective_background
+        retrieve_result = retrieve_parents_for_queries(
+            args.query,
+            plan.transform.retrieval_queries,
+            author=args.author,
+            index_dir=index_dir,
+            qdrant_path=qdrant_path,
+            encoder=encoder,
+            child_top_k=args.child_top_k,
+            per_query_parent_k=args.per_query_parent_k,
+            parent_top_k=args.parent_top_k,
+        )
+    else:
+        retrieve_result = retrieve_parents(
+            args.query,
+            author=args.author,
+            index_dir=index_dir,
+            qdrant_path=qdrant_path,
+            encoder=encoder,
+            child_top_k=args.child_top_k,
+            parent_top_k=args.parent_top_k,
+        )
+
+    return retrieve_result, query_trace, objective_background
+
+
+def _run_ask(args: argparse.Namespace) -> int:
+    retrieve_result, query_trace, objective_background = _retrieve_for_generation(args)
+    llm = DeepSeekJsonClient.from_env()
+    answer = generate_answer(
+        query=args.query,
+        parent_hits=retrieve_result.parents,
+        llm=llm,
+        objective_background=objective_background,
+        writer_prompt=args.writer_prompt,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+    )
+
+    if args.trace_path:
+        _write_ask_trace(
+            Path(args.trace_path),
+            query_trace=query_trace,
+            retrieve_result=retrieve_result,
+            answer=answer,
+            objective_background=objective_background,
+        )
+
+    print(answer.answer)
+    return 0
+
+
+def _run_prompt_pack(args: argparse.Namespace) -> int:
+    retrieve_result, query_trace, objective_background = _retrieve_for_generation(args)
+    prompt_pack = build_prompt_pack(
+        query=args.query,
+        parent_hits=retrieve_result.parents,
+        objective_background=objective_background,
+        writer_prompt=args.writer_prompt,
+    )
+
+    if args.trace_path:
+        _write_prompt_pack_trace(
+            Path(args.trace_path),
+            query_trace=query_trace,
+            retrieve_result=retrieve_result,
+            objective_background=objective_background,
+            writer_prompt=args.writer_prompt,
+        )
+
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(prompt_pack, encoding="utf-8", newline="\n")
+        print(f"Wrote prompt pack: {out_path}")
+    else:
+        print(prompt_pack, end="")
+    return 0
+
+
+def _write_retrieve_trace(path: Path, *, query_trace: dict | None, result) -> None:
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "query_understanding": query_trace,
+        "retrieval_queries": [
+            {"route": item.route, "query": item.query} for item in result.retrieval_queries
+        ],
+        "routes": {
+            name: [
+                {
+                    "rank": hit.rank,
+                    "score": hit.score,
+                    "node_id": hit.node_id,
+                    "parent_id": hit.parent_id,
+                    "node_type": hit.node_type,
+                    "title": hit.title,
+                    "path": hit.path,
+                    "route": hit.route,
+                }
+                for hit in hits
+            ]
+            for name, hits in result.routes.items()
+        },
+        "parents": [
+            {
+                "rank": hit.rank,
+                "parent_id": hit.parent_id,
+                "score": hit.score,
+                "title": hit.title,
+                "path": hit.path,
+                "first_hits": [
+                    {
+                        "rank": child.rank,
+                        "score": child.score,
+                        "node_id": child.node_id,
+                        "node_type": child.node_type,
+                        "route": child.route,
+                    }
+                    for child in hit.first_hits
+                ],
+            }
+            for hit in result.parents
+        ],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+
+
+def _write_ask_trace(path: Path, *, query_trace: dict | None, retrieve_result, answer, objective_background: str) -> None:
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "query_understanding": query_trace,
+        "objective_background": objective_background,
+        "retrieval_queries": [
+            {"route": item.route, "query": item.query} for item in retrieve_result.retrieval_queries
+        ],
+        "parents": [
+            {
+                "rank": hit.rank,
+                "parent_id": hit.parent_id,
+                "score": hit.score,
+                "title": hit.title,
+                "path": hit.path,
+                "first_hits": [
+                    {
+                        "rank": child.rank,
+                        "score": child.score,
+                        "node_id": child.node_id,
+                        "node_type": child.node_type,
+                        "route": child.route,
+                    }
+                    for child in hit.first_hits
+                ],
+            }
+            for hit in retrieve_result.parents
+        ],
+        "writer_parent_titles": answer.parent_titles,
+        "writer_prompt": answer.writer_prompt,
+        "answer": answer.answer,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+
+
+def _write_prompt_pack_trace(
+    path: Path,
+    *,
+    query_trace: dict | None,
+    retrieve_result,
+    objective_background: str,
+    writer_prompt: str,
+) -> None:
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "query_understanding": query_trace,
+        "objective_background": objective_background,
+        "retrieval_queries": [
+            {"route": item.route, "query": item.query} for item in retrieve_result.retrieval_queries
+        ],
+        "parents": [
+            {
+                "rank": hit.rank,
+                "parent_id": hit.parent_id,
+                "score": hit.score,
+                "title": hit.title,
+                "path": hit.path,
+                "first_hits": [
+                    {
+                        "rank": child.rank,
+                        "score": child.score,
+                        "node_id": child.node_id,
+                        "node_type": child.node_type,
+                        "route": child.route,
+                    }
+                    for child in hit.first_hits
+                ],
+            }
+            for hit in retrieve_result.parents
+        ],
+        "writer_parent_titles": [hit.title for hit in retrieve_result.parents],
+        "writer_prompt": writer_prompt,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+
+
+def _content_kinds(values: Iterable[str]) -> tuple[ContentKind, ...]:
+    return tuple(values)  # type: ignore[return-value]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

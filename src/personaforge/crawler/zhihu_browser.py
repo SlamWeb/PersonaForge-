@@ -1,0 +1,575 @@
+"""Playwright-backed Zhihu crawler fallback."""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse, urlunparse
+
+from personaforge.crawler.exceptions import CrawlBlocked, CrawlError, SourceFormatChanged
+from personaforge.crawler.models import ContentItem, ContentKind, utc_now_iso
+from personaforge.crawler.zhihu import (
+    ANSWER_API,
+    ANSWER_INCLUDE,
+    ARTICLE_API,
+    ARTICLE_DETAIL_API,
+    ARTICLE_DETAIL_INCLUDE,
+    ARTICLE_INCLUDE,
+    PIN_API,
+    PIN_INCLUDE,
+    PROFILE_API,
+    ZH_DOMAIN,
+    answer_payload_to_item,
+    article_payload_to_item,
+    blocked_reason_from_text,
+    extract_items_from_initial_data,
+    fallback_profile,
+    html_to_text,
+    parse_user_token,
+    pin_payload_to_item,
+    profile_payload_to_profile,
+    profile_path_for_kind,
+)
+
+ZH_SIGNIN_URL = "https://www.zhihu.com/signin?next=%2F"
+ZH_LINK_SELECTOR = ",".join(
+    [
+        "a[data-za-detail-view-element_name='Title']",
+        ".ContentItem-title a",
+        "a[href*='/question/'][href*='/answer/']",
+        "a[href*='zhuanlan.zhihu.com/p/']",
+        "a[href*='/pins/']",
+    ]
+)
+
+ANSWER_TITLE_SELECTORS = [
+    ".QuestionHeader-title",
+    ".QuestionHeader h1",
+    "h1",
+]
+ANSWER_CONTENT_SELECTORS = [
+    ".RichContent-inner",
+    ".ContentItem .RichContent",
+    ".RichText.ztext",
+    ".RichText",
+]
+ARTICLE_TITLE_SELECTORS = [
+    ".Post-Title",
+    "article h1",
+    "h1",
+]
+ARTICLE_CONTENT_SELECTORS = [
+    ".Post-RichText",
+    "article .RichText",
+    ".RichText.ztext",
+    ".RichText",
+    "article",
+]
+PIN_TITLE_SELECTORS = [
+    ".PinItem-title",
+    ".ContentItem-title",
+    "h1",
+]
+PIN_CONTENT_SELECTORS = [
+    ".PinItem-content",
+    ".PinItem .RichText",
+    ".RichText.ztext",
+    ".RichText",
+    ".ContentItem",
+]
+
+
+class ZhihuBrowserCrawler:
+    def __init__(
+        self,
+        *,
+        headless: bool = True,
+        storage_state: Path | None = None,
+        delay_seconds: float = 1.5,
+        use_api: bool = True,
+        max_api_pages: int | None = 10,
+        max_scrolls: int = 80,
+        stable_rounds: int = 5,
+        progress: Any | None = None,
+    ) -> None:
+        self.headless = headless
+        self.storage_state = storage_state
+        self.delay_seconds = delay_seconds
+        self.use_api = use_api
+        self.max_api_pages = max_api_pages
+        self.max_scrolls = max_scrolls
+        self.stable_rounds = stable_rounds
+        self.progress = progress
+
+    def crawl_profile(self, user: str):
+        token = parse_user_token(user)
+        with self._playwright_context() as context:
+            try:
+                payload = self._api_get_json(
+                    context,
+                    PROFILE_API.format(token=token),
+                    params=None,
+                    referer=f"{ZH_DOMAIN}/people/{token}",
+                )
+                return profile_payload_to_profile(payload, author_token=token)
+            except CrawlError:
+                return fallback_profile(token)
+
+    def crawl_user(
+        self,
+        user: str,
+        *,
+        kinds: Iterable[ContentKind] = ("article", "answer", "pin"),
+        max_items: int | None = 100,
+    ) -> list[ContentItem]:
+        token = parse_user_token(user)
+        items: list[ContentItem] = []
+        seen: set[tuple[str, str]] = set()
+        errors: list[str] = []
+
+        with self._playwright_context() as context:
+            page = context.new_page()
+            for kind in tuple(kinds):
+                remaining = None if max_items is None else max_items - len(items)
+                if remaining is not None and remaining <= 0:
+                    break
+
+                if self.use_api:
+                    try:
+                        for item in self._crawl_api_items(context, token, kind=kind, limit=remaining):
+                            key = (item.kind, item.id)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            items.append(item)
+                            if max_items is not None and len(items) >= max_items:
+                                return items
+                        if remaining is None or len(items) > 0:
+                            continue
+                    except CrawlError as exc:
+                        errors.append(f"{kind} api: {exc}")
+                        self._progress(f"browser API {kind} failed: {exc}")
+
+                try:
+                    links = self.collect_links(page, token, kind=kind, limit=remaining)
+                    for link in links:
+                        item = self.extract_item(page, link, kind=kind, author_token=token)
+                        key = (item.kind, item.id)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        items.append(item)
+                        if max_items is not None and len(items) >= max_items:
+                            return items
+                except CrawlError as exc:
+                    errors.append(f"{kind} page: {exc}")
+                    self._progress(f"browser page {kind} failed: {exc}")
+
+        if not items and errors:
+            raise CrawlBlocked("; ".join(errors))
+        return items
+
+    def _crawl_api_items(
+        self,
+        context: Any,
+        token: str,
+        *,
+        kind: ContentKind,
+        limit: int | None,
+    ) -> list[ContentItem]:
+        url = api_url_for_kind(token, kind)
+        params = api_params_for_kind(kind, limit=limit)
+        referer = f"{ZH_DOMAIN}/people/{token}/{profile_path_for_kind(kind)}"
+        items: list[ContentItem] = []
+        page_index = 0
+
+        while self.max_api_pages is None or page_index < self.max_api_pages:
+            payload = self._api_get_json(context, url, params=params, referer=referer)
+            data = payload.get("data")
+            if not isinstance(data, list):
+                raise SourceFormatChanged("Zhihu API response is missing data list.")
+
+            for item_payload in data:
+                if not isinstance(item_payload, dict):
+                    continue
+                if kind == "answer":
+                    item = answer_payload_to_item(item_payload, author_token=token)
+                elif kind == "article":
+                    if not item_payload.get("content") and item_payload.get("id"):
+                        detail = self._fetch_article_detail_api(context, str(item_payload["id"]))
+                        item_payload = {**item_payload, **detail}
+                    item = article_payload_to_item(item_payload, author_token=token)
+                elif kind == "pin":
+                    item = pin_payload_to_item(item_payload, author_token=token)
+                else:
+                    raise ValueError(f"Unsupported Zhihu content kind: {kind}")
+                items.append(item)
+                if limit is not None and len(items) >= limit:
+                    return items
+
+            paging = payload.get("paging") or {}
+            if paging.get("is_end"):
+                break
+            next_url = paging.get("next")
+            if not next_url:
+                break
+            url = next_url
+            params = None
+            page_index += 1
+            self._sleep()
+        return items
+
+    def _fetch_article_detail_api(self, context: Any, article_id: str) -> dict[str, Any]:
+        self._sleep()
+        return self._api_get_json(
+            context,
+            ARTICLE_DETAIL_API.format(article_id=article_id),
+            params={"include": ARTICLE_DETAIL_INCLUDE},
+            referer=f"https://zhuanlan.zhihu.com/p/{article_id}",
+        )
+
+    def _api_get_json(
+        self,
+        context: Any,
+        url: str,
+        *,
+        params: dict[str, Any] | None,
+        referer: str,
+    ) -> dict[str, Any]:
+        response = context.request.get(url, params=params, headers={"Referer": referer}, timeout=60_000)
+        text = response.text()
+        if response.status in {401, 403, 429}:
+            reason = blocked_reason_from_text(text)
+            raise CrawlBlocked(
+                f"Zhihu API returned HTTP {response.status}"
+                + (f" ({reason})" if reason else "; login, rate limit, or verification may be required")
+            )
+        if response.status >= 400:
+            raise CrawlError(f"Zhihu API returned HTTP {response.status} for {url}")
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise SourceFormatChanged("Zhihu API returned non-JSON content.") from exc
+        if not isinstance(payload, dict):
+            raise SourceFormatChanged("Zhihu API returned a non-object JSON payload.")
+        return payload
+
+    def collect_links(self, page: Any, token: str, *, kind: ContentKind, limit: int | None) -> list[str]:
+        url = f"{ZH_DOMAIN}/people/{token}/{profile_path_for_kind(kind)}"
+        self._progress(f"open {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        self._settle_page(page)
+
+        links: list[str] = []
+        seen: set[str] = set()
+        last_height = 0
+        stable_count = 0
+
+        for _ in range(self.max_scrolls):
+            for href in self._page_links(page):
+                normalized = normalize_zhihu_link(href)
+                if normalized and link_matches_kind(normalized, kind) and normalized not in seen:
+                    seen.add(normalized)
+                    links.append(normalized)
+                    if limit is not None and len(links) >= limit:
+                        return links
+            height = int(page.evaluate("document.body.scrollHeight"))
+            if height == last_height:
+                stable_count += 1
+                if stable_count >= self.stable_rounds:
+                    break
+            else:
+                stable_count = 0
+                last_height = height
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            self._sleep()
+        return links
+
+    def extract_item(self, page: Any, url: str, *, kind: ContentKind, author_token: str) -> ContentItem:
+        self._progress(f"open item {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        self._settle_page(page)
+
+        item = self._extract_from_initial_data(
+            page.content(),
+            url=url,
+            kind=kind,
+            author_token=author_token,
+        )
+        if item is not None and item.content_text:
+            return item
+
+        return self._extract_from_dom(page, url=url, kind=kind, author_token=author_token)
+
+    def _extract_from_initial_data(
+        self,
+        html: str,
+        *,
+        url: str,
+        kind: ContentKind,
+        author_token: str,
+    ) -> ContentItem | None:
+        try:
+            items = extract_items_from_initial_data(html, author_token=author_token, kinds=(kind,))
+        except CrawlError:
+            return None
+        content_id = content_id_from_url(url, kind)
+        if content_id:
+            for item in items:
+                if item.id == content_id:
+                    return item
+        return items[0] if items else None
+
+    def _extract_from_dom(self, page: Any, url: str, *, kind: ContentKind, author_token: str) -> ContentItem:
+        item_id = content_id_from_url(url, kind) or stable_id_from_url(url)
+        title = first_text(page, title_selectors_for_kind(kind)) or f"Zhihu {kind} {item_id}"
+        content_html = first_inner_html(page, content_selectors_for_kind(kind))
+        if not content_html:
+            raise SourceFormatChanged(f"Could not extract content from {url}")
+        metadata: dict[str, Any] = {}
+        question_id = question_id_from_answer_url(url)
+        if question_id:
+            metadata["question_id"] = question_id
+        return ContentItem(
+            source="zhihu",
+            kind=kind,
+            id=item_id,
+            title=title or f"Zhihu {kind} {item_id}",
+            url=url,
+            author_token=author_token,
+            content_html=content_html,
+            content_text=html_to_text(content_html),
+            fetched_at=utc_now_iso(),
+            metadata=metadata,
+        )
+
+    def _playwright_context(self) -> Any:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise CrawlError("Playwright is not installed. Run `pip install -e .[crawler]`.") from exc
+        return _PlaywrightContextManager(
+            sync_playwright=sync_playwright,
+            headless=self.headless,
+            storage_state=self.storage_state,
+        )
+
+    def _settle_page(self, page: Any) -> None:
+        self._sleep()
+        try:
+            page.wait_for_load_state("networkidle", timeout=8_000)
+        except Exception:
+            pass
+        text = page.locator("body").inner_text(timeout=5_000)
+        reason = blocked_reason_from_text(text)
+        if reason:
+            raise CrawlBlocked(f"Zhihu returned {reason} page.")
+
+    def _page_links(self, page: Any) -> list[str]:
+        return page.eval_on_selector_all(
+            ZH_LINK_SELECTOR,
+            "elements => elements.map(e => e.href).filter(Boolean)",
+        )
+
+    def _sleep(self) -> None:
+        if self.delay_seconds > 0:
+            time.sleep(self.delay_seconds)
+
+    def _progress(self, message: str) -> None:
+        if self.progress is not None:
+            self.progress(message)
+
+
+class _PlaywrightContextManager:
+    def __init__(self, *, sync_playwright: Any, headless: bool, storage_state: Path | None) -> None:
+        self.sync_playwright = sync_playwright
+        self.headless = headless
+        self.storage_state = storage_state
+        self.playwright: Any = None
+        self.browser: Any = None
+        self.context: Any = None
+
+    def __enter__(self) -> Any:
+        self.playwright = self.sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(headless=self.headless)
+        options: dict[str, Any] = {"viewport": {"width": 1920, "height": 1080}}
+        if self.storage_state:
+            options["storage_state"] = load_storage_state(self.storage_state)
+        self.context = self.browser.new_context(**options)
+        return self.context
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self.context is not None:
+            self.context.close()
+        if self.browser is not None:
+            self.browser.close()
+        if self.playwright is not None:
+            self.playwright.stop()
+
+
+def save_zhihu_session(
+    storage_state: Path,
+    *,
+    start_url: str = ZH_SIGNIN_URL,
+    timeout_seconds: float = 300.0,
+    poll_seconds: float = 2.0,
+) -> None:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise CrawlError("Playwright is not installed. Run `pip install -e .[crawler]`.") from exc
+
+    storage_state.parent.mkdir(parents=True, exist_ok=True)
+    playwright = sync_playwright().start()
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context(viewport={"width": 1920, "height": 1080})
+    try:
+        page = context.new_page()
+        page.goto(start_url, wait_until="domcontentloaded", timeout=60_000)
+        print("A Chromium window is open. Log in to Zhihu there.")
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            cookies = context.cookies([ZH_DOMAIN])
+            if has_zhihu_login_cookie(cookies):
+                context.storage_state(path=str(storage_state))
+                return
+            time.sleep(poll_seconds)
+        raise CrawlError("Timed out waiting for Zhihu login.")
+    finally:
+        context.close()
+        browser.close()
+        playwright.stop()
+
+
+def has_zhihu_login_cookie(cookies: Iterable[dict[str, Any]]) -> bool:
+    for cookie in cookies:
+        name = cookie.get("name")
+        domain = str(cookie.get("domain") or "")
+        value = cookie.get("value")
+        if name == "z_c0" and value and "zhihu.com" in domain:
+            return True
+    return False
+
+
+def load_storage_state(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and "cookies" in payload:
+        return payload
+    if isinstance(payload, list):
+        return {"cookies": payload, "origins": []}
+    raise ValueError("Storage state must be Playwright storage_state JSON or a cookie list JSON.")
+
+
+def normalize_zhihu_link(href: str) -> str | None:
+    parsed = urlparse(href)
+    if not parsed.netloc and parsed.path.startswith("/"):
+        parsed = urlparse(f"{ZH_DOMAIN}{href}")
+    if parsed.netloc not in {"www.zhihu.com", "zhuanlan.zhihu.com"}:
+        return None
+    if not parsed.scheme:
+        parsed = parsed._replace(scheme="https")
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "", ""))
+
+
+def link_matches_kind(url: str, kind: ContentKind) -> bool:
+    parsed = urlparse(url)
+    if kind == "answer":
+        return bool(re.search(r"/question/\d+/answer/\d+$", parsed.path))
+    if kind == "article":
+        return parsed.netloc == "zhuanlan.zhihu.com" and bool(re.search(r"/p/\d+$", parsed.path))
+    if kind == "pin":
+        return parsed.netloc == "www.zhihu.com" and bool(re.search(r"/pins?/\d+$", parsed.path))
+    return False
+
+
+def content_id_from_url(url: str, kind: ContentKind) -> str | None:
+    if kind == "answer":
+        pattern = r"/answer/(\d+)"
+    elif kind == "article":
+        pattern = r"/p/(\d+)"
+    elif kind == "pin":
+        pattern = r"/pins?/(\d+)"
+    else:
+        return None
+    match = re.search(pattern, urlparse(url).path)
+    return match.group(1) if match else None
+
+
+def question_id_from_answer_url(url: str) -> str | None:
+    match = re.search(r"/question/(\d+)/answer/\d+", urlparse(url).path)
+    return match.group(1) if match else None
+
+
+def stable_id_from_url(url: str) -> str:
+    return re.sub(r"\W+", "-", urlparse(url).path).strip("-") or "unknown"
+
+
+def first_inner_html(page: Any, selectors: Iterable[str]) -> str:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() > 0:
+                html = locator.inner_html(timeout=2_000).strip()
+                if html:
+                    return html
+        except Exception:
+            continue
+    return ""
+
+
+def first_text(page: Any, selectors: Iterable[str]) -> str:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() > 0:
+                text = locator.inner_text(timeout=2_000).strip()
+                if text:
+                    return text
+        except Exception:
+            continue
+    return ""
+
+
+def title_selectors_for_kind(kind: ContentKind) -> list[str]:
+    if kind == "answer":
+        return ANSWER_TITLE_SELECTORS
+    if kind == "article":
+        return ARTICLE_TITLE_SELECTORS
+    if kind == "pin":
+        return PIN_TITLE_SELECTORS
+    raise ValueError(f"Unsupported Zhihu content kind: {kind}")
+
+
+def content_selectors_for_kind(kind: ContentKind) -> list[str]:
+    if kind == "answer":
+        return ANSWER_CONTENT_SELECTORS
+    if kind == "article":
+        return ARTICLE_CONTENT_SELECTORS
+    if kind == "pin":
+        return PIN_CONTENT_SELECTORS
+    raise ValueError(f"Unsupported Zhihu content kind: {kind}")
+
+
+def api_url_for_kind(token: str, kind: ContentKind) -> str:
+    if kind == "answer":
+        return ANSWER_API.format(token=token)
+    if kind == "article":
+        return ARTICLE_API.format(token=token)
+    if kind == "pin":
+        return PIN_API.format(token=token)
+    raise ValueError(f"Unsupported Zhihu content kind: {kind}")
+
+
+def api_params_for_kind(kind: ContentKind, *, limit: int | None) -> dict[str, Any]:
+    page_limit = min(20, limit) if limit is not None else 20
+    if kind == "answer":
+        return {"include": ANSWER_INCLUDE, "offset": 0, "limit": page_limit, "sort_by": "created"}
+    if kind == "article":
+        return {"include": ARTICLE_INCLUDE, "offset": 0, "limit": page_limit, "sort_by": "created"}
+    if kind == "pin":
+        return {"include": PIN_INCLUDE, "offset": 0, "limit": page_limit}
+    raise ValueError(f"Unsupported Zhihu content kind: {kind}")

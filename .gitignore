@@ -1,0 +1,42 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Local user data
+data/raw/
+data/authors/
+data/index/
+data/auth/
+data/models/
+data/eval/
+.tmp/
+.tmp-data/
+.tmp-crawl/
+
+# Runtime artifacts
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
