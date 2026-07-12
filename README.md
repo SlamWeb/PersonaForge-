@@ -25,9 +25,59 @@ pf init
 python -m pytest -q
 ```
 
-The real crawl/build/chat pipeline is still being implemented. The current repository contains the project skeleton, CLI entrypoint, and mock Zhihu-like corpus.
+The current MVP contains:
 
-Current decisions:
+- Zhihu-like crawler output contract.
+- Markdown -> parent docs -> title/lead/passage child nodes.
+- BGE-M3 dense+sparse local Qdrant indexing.
+- Query understanding + query transform + RAG20 generation.
+- FastAPI Web backend with SSE streaming.
+- React/Vite Web frontend.
+
+## Web MVP
+
+Install backend Web dependencies:
+
+```powershell
+pip install -e ".[web,dev]"
+```
+
+Start the FastAPI backend:
+
+```powershell
+pf web mock-columnist --port 8000
+```
+
+For frontend development:
+
+```powershell
+cd web
+npm install
+npm run dev
+```
+
+Open:
+
+```text
+http://127.0.0.1:5173/
+```
+
+For a single-port local run, build the frontend first and let FastAPI serve `web/dist`:
+
+```powershell
+cd web
+npm run build
+cd ..
+pf web mock-columnist --port 8000
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8000/
+```
+
+## Current Decisions
 
 - MVP is a local CLI + local Web app, not a hosted crawler service.
 - Sample corpus will use self-made Zhihu-like Markdown under `samples/zhihu_mock_md/`.
@@ -36,6 +86,8 @@ Current decisions:
 - Query transform happens at query time.
 - LLM providers will be abstracted for DeepSeek, OpenAI, and OpenRouter.
 - Embedding stays local with BGE-M3 in the first version.
+- Web uses FastAPI + React/Vite. Streamlit/Gradio are not the main architecture.
+- Web v0 supports existing local indexes only; crawl/build/index stay in CLI.
 
 No real crawled corpus, auth state, local index, model files, eval output, or API keys should be committed.
 

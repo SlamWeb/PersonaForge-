@@ -34,6 +34,9 @@ dist/
 *.egg-info/
 .venv/
 venv/
+node_modules/
+web/node_modules/
+web/dist/
 
 # Editors and OS
 .idea/

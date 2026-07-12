@@ -70,6 +70,15 @@ Web 负责：
 
 Web 第一版不负责输入用户名和触发爬取。用户名、抓取和 build 都先在 CLI 完成。
 
+Web 技术栈采用：
+
+```text
+FastAPI + SSE 后端
+React/Vite + TypeScript 前端
+```
+
+选择原因：项目面向“后端 + AI 应用 / LLM/RAG 工程”求职叙事，FastAPI 更适合展示 API schema、服务层、流式响应和后续 trace/eval 扩展；React/Vite 让 MVP 更像真实前后端产品，但第一版不引入 UI 组件库。
+
 ## 5. 建议命令形态
 
 最终希望支持：
@@ -351,6 +360,16 @@ Web 目标是可用，不是营销首页。
 - 可以展开查看检索 parent、child 命中和排名。
 
 Web 不展示 raw corpus 全文，除非用户明确展开来源。
+
+Web v0 只接已有本地 index，不触发 crawl/build/index。流式输出使用真 SSE：
+
+```text
+DeepSeek stream
+-> FastAPI StreamingResponse
+-> React fetch ReadableStream
+```
+
+trace 时间线和评估面板放到 MVP 后的下一阶段。
 
 ## 14. 安全与开源边界
 

@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Iterator, Protocol
 
 from personaforge.env import first_env_value, load_env_file
 
@@ -33,6 +33,15 @@ class JsonChatClient(Protocol):
         max_tokens: int = 1024,
     ) -> dict[str, object]:
         """Return a JSON object from chat messages."""
+
+    def stream_text(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> Iterator[str]:
+        """Yield text chunks from chat messages."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +109,29 @@ class DeepSeekJsonClient:
             raise ValueError(f"Unexpected chat completion payload: {payload!r}") from exc
         return text
 
+    def stream_text(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> Iterator[str]:
+        body: dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if self.thinking:
+            body["thinking"] = {"type": self.thinking}
+        yield from _post_json_stream(
+            _chat_endpoint(self.base_url),
+            body,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout_seconds=self.timeout_seconds,
+        )
+
 
 def parse_json_object(text: str) -> dict[str, object]:
     cleaned = text.strip()
@@ -140,6 +172,56 @@ def _post_json(
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
     return json.loads(payload)
+
+
+def _post_json_stream(
+    url: str,
+    body: dict[str, object],
+    *,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: float = 90.0,
+) -> Iterator[str]:
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    request_headers = {
+        "Content-Type": "application/json",
+        **(headers or {}),
+    }
+    request = urllib.request.Request(url, data=data, headers=request_headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_part = line.removeprefix("data:").strip()
+                if data_part == "[DONE]":
+                    break
+                try:
+                    payload = json.loads(data_part)
+                except json.JSONDecodeError:
+                    continue
+                text = _stream_delta_text(payload)
+                if text:
+                    yield text
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
+
+
+def _stream_delta_text(payload: dict[str, object]) -> str:
+    try:
+        choices = payload["choices"]
+        if not isinstance(choices, list) or not choices:
+            return ""
+        first = choices[0]
+        if not isinstance(first, dict):
+            return ""
+        delta = first.get("delta") or {}
+        if not isinstance(delta, dict):
+            return ""
+        return str(delta.get("content") or "")
+    except (KeyError, TypeError):
+        return ""
 
 
 def _chat_endpoint(base_url: str) -> str:

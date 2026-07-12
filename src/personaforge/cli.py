@@ -18,6 +18,7 @@ from personaforge.ingest.index import index_corpus
 from personaforge.ingest.query_understanding import build_grounded_query_plan, plan_to_trace
 from personaforge.ingest.retrieve import retrieve_parents, retrieve_parents_for_queries
 from personaforge.llm import DeepSeekJsonClient
+from personaforge.persona.suggestions import generate_suggestions
 from personaforge.persona.writer import WRITER_PROMPT_CHOICES, build_prompt_pack, generate_answer
 
 
@@ -184,9 +185,31 @@ def build_parser() -> argparse.ArgumentParser:
     prompt_pack_parser.add_argument("--trace-path", help="Optional JSON file for query and retrieval trace.")
     prompt_pack_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
 
+    suggest_parser = subparsers.add_parser("suggest", help="Generate product-facing suggested questions for a persona.")
+    suggest_parser.add_argument("author", help="Creator token.")
+    suggest_parser.add_argument("--index-dir", help="Directory containing parents.jsonl.")
+    suggest_parser.add_argument("--out", help="Output suggestions JSON path.")
+    suggest_parser.add_argument("--count", type=int, default=6, help="Number of suggestions to keep.")
+    suggest_parser.add_argument("--source-limit", type=int, default=80, help="Number of history titles to send to the LLM.")
+
     web_parser = subparsers.add_parser("web", help="Start the local Web UI.")
     web_parser.add_argument("author", nargs="?", help="Creator token.")
     web_parser.add_argument("--port", type=int, default=8000)
+    web_parser.add_argument("--data-dir", default="data", help="Local data root.")
+    web_parser.add_argument("--model-name", default="BAAI/bge-m3", help="Embedding model name.")
+    web_parser.add_argument(
+        "--embedding-device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device for query embedding.",
+    )
+    web_parser.add_argument("--child-top-k", type=int, default=100)
+    web_parser.add_argument("--per-query-parent-k", type=int, default=30)
+    web_parser.add_argument("--parent-top-k", type=int, default=20)
+    web_parser.add_argument("--max-search-results", type=int, default=5)
+    web_parser.add_argument("--temperature", type=float, default=0.85)
+    web_parser.add_argument("--max-tokens", type=int, default=1600)
+    web_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
 
     forge_parser = subparsers.add_parser("forge", help="Crawl, build, and start the local Web UI.")
     forge_parser.add_argument("platform", choices=["zhihu"])
@@ -243,7 +266,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "prompt-pack":
         return _run_prompt_pack(args)
 
-    if args.command in {"web", "forge"}:
+    if args.command == "suggest":
+        return _run_suggest(args)
+
+    if args.command == "web":
+        return _run_web(args)
+
+    if args.command == "forge":
         parser.error(f"`pf {args.command}` is specified but not implemented yet.")
 
     parser.print_help()
@@ -534,6 +563,29 @@ def _run_prompt_pack(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_suggest(args: argparse.Namespace) -> int:
+    index_dir = Path(args.index_dir) if args.index_dir else Path("data/authors") / "zhihu" / args.author / "index"
+    out_path = (
+        Path(args.out)
+        if args.out
+        else Path("data/authors") / "zhihu" / args.author / "profile_suggestions.json"
+    )
+    llm = DeepSeekJsonClient.from_env()
+    result = generate_suggestions(
+        author=args.author,
+        index_dir=index_dir,
+        out_path=out_path,
+        llm=llm,
+        count=args.count,
+        source_limit=args.source_limit,
+    )
+    print(f"Generated {len(result.suggestions)} suggestion(s) from {result.source_title_count} title(s):")
+    for idx, item in enumerate(result.suggestions, start=1):
+        print(f"{idx}. {item}")
+    print(f"Wrote: {result.path}")
+    return 0
+
+
 def _write_retrieve_trace(path: Path, *, query_trace: dict | None, result) -> None:
     import json
 
@@ -661,6 +713,28 @@ def _write_prompt_pack_trace(
         "writer_prompt": writer_prompt,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+
+
+def _run_web(args: argparse.Namespace) -> int:
+    from personaforge.web.app import run_web
+    from personaforge.web.service import WebConfig
+
+    config = WebConfig(
+        author=args.author,
+        data_dir=Path(args.data_dir),
+        port=args.port,
+        model_name=args.model_name,
+        embedding_device=args.embedding_device,
+        use_fp16=not args.no_fp16,
+        child_top_k=args.child_top_k,
+        per_query_parent_k=args.per_query_parent_k,
+        parent_top_k=args.parent_top_k,
+        max_search_results=args.max_search_results,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+    )
+    run_web(config)
+    return 0
 
 
 def _content_kinds(values: Iterable[str]) -> tuple[ContentKind, ...]:
