@@ -6,14 +6,31 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Iterator
 from uuid import uuid4
 
 from personaforge.ingest.embeddings import BgeM3Encoder, TextEncoder
-from personaforge.ingest.query_understanding import build_grounded_query_plan, plan_to_trace
+from personaforge.ingest.query_understanding import (
+    GroundedQueryPlan,
+    TavilySearchClient,
+    build_background_and_retrieval_queries,
+    plan_to_trace,
+    plan_web_search,
+)
 from personaforge.ingest.retrieve import ParentHit, RetrieveResult, retrieve_parents, retrieve_parents_for_queries
 from personaforge.llm import DeepSeekJsonClient, JsonChatClient
 from personaforge.persona.writer import build_writer_messages
+from personaforge.web.trace import (
+    DEFAULT_TRACE_RETENTION,
+    TRACE_SCHEMA_VERSION,
+    estimated_usage_for_text,
+    new_stage,
+    new_trace_id,
+    provider_usage,
+    read_trace,
+    write_trace,
+)
 
 
 @dataclass(slots=True)
@@ -30,6 +47,7 @@ class WebConfig:
     max_search_results: int = 5
     temperature: float = 0.85
     max_tokens: int = 1600
+    trace_retention: int = DEFAULT_TRACE_RETENTION
 
 
 @dataclass(slots=True)
@@ -56,6 +74,26 @@ class PreparedChat:
     query_trace: dict[str, Any] | None
     retrieve_result: RetrieveResult
     messages: list[dict[str, str]]
+    trace_capture: str = "summary"
+    trace_id: str = ""
+    trace_created_at: str = ""
+    trace_started_at: float = 0.0
+    query_understanding_duration_ms: int = 0
+    retrieval_duration_ms: int = 0
+    writer_build_duration_ms: int = 0
+    generation_started_at: float | None = None
+    generation_duration_ms: int = 0
+    generation_ttft_ms: int | None = None
+    generation_usage: dict[str, Any] | None = None
+    stages: list[dict[str, Any]] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ChatProgress:
+    """A user-visible execution stage emitted before the work actually starts."""
+
+    stage: str
+    label: str
 
 
 class PersonaChatService:
@@ -88,42 +126,267 @@ class PersonaChatService:
         query_mode: str,
         writer_prompt: str,
         parent_top_k: int | None = None,
+        trace_capture: str = "summary",
     ) -> PreparedChat:
+        prepared: PreparedChat | None = None
+        for item in self.iter_prepare_chat(
+            author=author,
+            session_id=session_id,
+            query=query,
+            query_mode=query_mode,
+            writer_prompt=writer_prompt,
+            parent_top_k=parent_top_k,
+            trace_capture=trace_capture,
+        ):
+            if isinstance(item, PreparedChat):
+                prepared = item
+        if prepared is None:  # pragma: no cover - defensive invariant.
+            raise RuntimeError("Chat preparation finished without a prepared request.")
+        return prepared
+
+    def iter_prepare_chat(
+        self,
+        *,
+        author: str | None,
+        session_id: str | None,
+        query: str,
+        query_mode: str,
+        writer_prompt: str,
+        parent_top_k: int | None = None,
+        trace_capture: str = "summary",
+    ) -> Iterator[ChatProgress | PreparedChat]:
         selected_author = (author or self.default_author() or "").strip()
         if not selected_author:
             raise ValueError("No local persona index found. Run `pf build` and `pf index` first.")
 
         selected_session_id = session_id or new_session_id()
-        retrieve_result, query_trace, objective_background = self._retrieve(
-            author=selected_author,
-            query=query,
-            query_mode=query_mode,
-            parent_top_k=parent_top_k or self.config.parent_top_k,
-        )
-        messages = build_writer_messages(
-            query=query,
-            parent_hits=retrieve_result.parents,
-            objective_background=objective_background,
-            writer_prompt=writer_prompt,
-        )
-        return PreparedChat(
+        trace_id = new_trace_id()
+        trace_created_at = utc_now()
+        trace_started_at = perf_counter()
+        resolved_parent_top_k = parent_top_k or self.config.parent_top_k
+        if trace_capture not in {"summary", "full"}:
+            raise ValueError(f"Unknown trace_capture: {trace_capture}")
+        try:
+            index_dir = self.config.data_dir / "authors" / "zhihu" / selected_author / "index"
+            qdrant_path = index_dir / "qdrant"
+            query_trace: dict[str, Any] | None = None
+            objective_background = ""
+            understanding_ms = 0
+            stages: list[dict[str, Any]] = []
+            llm = self._get_llm()
+
+            if query_mode == "grounded":
+                yield ChatProgress(stage="understanding", label="正在理解问题")
+                stage_started_at = perf_counter()
+                search_plan = plan_web_search(query, llm=llm)
+                stages.append(
+                    self._stage(
+                        "search_planner",
+                        "判断题目是否需要外部背景",
+                        stage_started_at,
+                        details={"needs_web": search_plan.needs_web, "search_query_count": len(search_plan.search_queries)},
+                        usage=self._usage_or_estimate(llm, query),
+                    )
+                )
+                search_results = []
+                grounding_error: dict[str, str] | None = None
+                if search_plan.needs_web:
+                    yield ChatProgress(stage="web_grounding", label="正在查询相关背景")
+                    stage_started_at = perf_counter()
+                    try:
+                        search_results = TavilySearchClient.from_env().search_many(
+                            search_plan.search_queries,
+                            max_results=self.config.max_search_results,
+                        )
+                        stages.append(
+                            self._stage(
+                                "tavily_search",
+                                "获取公开背景资料",
+                                stage_started_at,
+                                details={"search_query_count": len(search_plan.search_queries), "result_count": len(search_results)},
+                            )
+                        )
+                    except Exception as exc:  # An auxiliary source must not block a local RAG answer.
+                        grounding_error = trace_error(exc)
+                        stages.append(
+                            self._stage(
+                                "tavily_search",
+                                "获取公开背景资料",
+                                stage_started_at,
+                                status="fallback",
+                                details={"search_query_count": len(search_plan.search_queries), "error": grounding_error},
+                            )
+                        )
+                        yield ChatProgress(
+                            stage="web_fallback",
+                            label="未获得额外背景，继续检索作者历史表达",
+                        )
+
+                yield ChatProgress(stage="query_transform", label="正在整理检索线索")
+                stage_started_at = perf_counter()
+                transform = build_background_and_retrieval_queries(
+                    query,
+                    search_results=search_results,
+                    llm=llm,
+                )
+                stages.append(
+                    self._stage(
+                        "query_transform",
+                        "生成多路检索表达",
+                        stage_started_at,
+                        details={"retrieval_query_count": len(transform.retrieval_queries), "has_background": bool(transform.objective_background)},
+                        usage=self._usage_or_estimate(llm, query, *[str(item) for item in search_results]),
+                    )
+                )
+                plan = GroundedQueryPlan(
+                    original_query=query,
+                    search_plan=search_plan,
+                    search_results=search_results,
+                    transform=transform,
+                )
+                query_trace = plan_to_trace(plan)
+                if grounding_error is not None:
+                    query_trace["web_grounding_error"] = grounding_error
+                objective_background = transform.objective_background
+                understanding_ms = sum(stage.get("duration_ms", 0) for stage in stages)
+                retrieval_queries = transform.retrieval_queries
+            elif query_mode == "raw":
+                retrieval_queries = None
+            else:
+                raise ValueError(f"Unknown query_mode: {query_mode}")
+
+            yield ChatProgress(stage="retrieval", label="正在检索历史表达")
+            retrieval_started_at = perf_counter()
+            if retrieval_queries is None:
+                retrieve_result = retrieve_parents(
+                    query,
+                    author=selected_author,
+                    index_dir=index_dir,
+                    qdrant_path=qdrant_path,
+                    encoder=self._get_encoder(),
+                    child_top_k=self.config.child_top_k,
+                    parent_top_k=resolved_parent_top_k,
+                )
+            else:
+                retrieve_result = retrieve_parents_for_queries(
+                    query,
+                    retrieval_queries,
+                    author=selected_author,
+                    index_dir=index_dir,
+                    qdrant_path=qdrant_path,
+                    encoder=self._get_encoder(),
+                    child_top_k=self.config.child_top_k,
+                    per_query_parent_k=self.config.per_query_parent_k,
+                    parent_top_k=resolved_parent_top_k,
+                )
+            retrieval_ms = elapsed_ms(retrieval_started_at)
+            stages.extend(self._retrieval_stages(retrieve_result, retrieval_started_at))
+
+            yield ChatProgress(stage="writer", label="正在准备回答")
+            writer_started_at = perf_counter()
+            messages = build_writer_messages(
+                query=query,
+                parent_hits=retrieve_result.parents,
+                objective_background=objective_background,
+                writer_prompt=writer_prompt,
+            )
+            stages.append(
+                self._stage(
+                    "writer_pack",
+                    "组织作者历史表达与写作指令",
+                    writer_started_at,
+                    details={
+                        "parent_count": len(retrieve_result.parents),
+                        "message_count": len(messages),
+                        "context_characters": sum(len(message.get("content", "")) for message in messages),
+                    },
+                    usage=estimated_usage_for_text(*(message.get("content", "") for message in messages)),
+                )
+            )
+        except Exception as exc:
+            self._write_prepare_failure_trace(
+                author=selected_author,
+                session_id=selected_session_id,
+                trace_id=trace_id,
+                created_at=trace_created_at,
+                query=query,
+                query_mode=query_mode,
+                writer_prompt=writer_prompt,
+                parent_top_k=resolved_parent_top_k,
+                error=exc,
+            )
+            raise
+
+        prepared = PreparedChat(
             session_id=selected_session_id,
             author=selected_author,
             query=query,
             query_mode=query_mode,
             writer_prompt=writer_prompt,
+            trace_capture=trace_capture,
             objective_background=objective_background,
             query_trace=query_trace,
             retrieve_result=retrieve_result,
             messages=messages,
+            trace_id=trace_id,
+            trace_created_at=trace_created_at,
+            trace_started_at=trace_started_at,
+            query_understanding_duration_ms=understanding_ms,
+            retrieval_duration_ms=retrieval_ms,
+            writer_build_duration_ms=elapsed_ms(writer_started_at),
+            stages=stages,
         )
+        self.record_prepared_trace(prepared)
+        yield prepared
 
     def stream_answer(self, prepared: PreparedChat) -> Iterator[str]:
-        yield from self._get_llm().stream_text(
-            prepared.messages,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-        )
+        prepared.generation_started_at = perf_counter()
+        first_token_at: float | None = None
+        usage_payload: dict[str, Any] | None = None
+
+        def receive_usage(usage: Any) -> None:
+            nonlocal usage_payload
+            usage_payload = provider_usage(usage)
+
+        try:
+            llm = self._get_llm()
+            stream_with_usage = getattr(llm, "stream_text_with_usage", None)
+            if callable(stream_with_usage):
+                stream = stream_with_usage(
+                    prepared.messages,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
+                    on_usage=receive_usage,
+                )
+            else:
+                stream = llm.stream_text(
+                    prepared.messages,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
+                )
+            for token in stream:
+                if first_token_at is None:
+                    first_token_at = perf_counter()
+                    prepared.generation_ttft_ms = elapsed_ms(prepared.generation_started_at)
+                yield token
+        finally:
+            if prepared.generation_started_at is not None:
+                prepared.generation_duration_ms = elapsed_ms(prepared.generation_started_at)
+            prepared.generation_usage = usage_payload or self._usage_or_estimate(
+                self._get_llm(), *(message.get("content", "") for message in prepared.messages)
+            )
+
+    def record_prepared_trace(self, prepared: PreparedChat) -> Path:
+        return self._write_trace(prepared, status="prepared")
+
+    def complete_trace(self, prepared: PreparedChat, answer: str) -> Path:
+        return self._write_trace(prepared, status="completed", answer=answer)
+
+    def fail_trace(self, prepared: PreparedChat, error: Exception) -> Path:
+        return self._write_trace(prepared, status="failed", error=error)
+
+    def get_trace(self, author: str, trace_id: str) -> dict[str, Any]:
+        return read_trace(self.config.data_dir, author, trace_id)
 
     def list_sessions(self, author: str) -> list[dict[str, Any]]:
         sessions: list[dict[str, Any]] = []
@@ -190,55 +453,17 @@ class PersonaChatService:
         payload["updated_at"] = now
         messages = payload.setdefault("messages", [])
         messages.append({"role": "user", "text": prepared.query})
-        messages.append({"role": "assistant", "text": answer, "sources": sources})
+        messages.append(
+            {
+                "role": "assistant",
+                "text": answer,
+                "sources": sources,
+                "trace_id": prepared.trace_id or None,
+            }
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return payload
-
-    def _retrieve(
-        self,
-        *,
-        author: str,
-        query: str,
-        query_mode: str,
-        parent_top_k: int,
-    ) -> tuple[RetrieveResult, dict[str, Any] | None, str]:
-        index_dir = self.config.data_dir / "authors" / "zhihu" / author / "index"
-        qdrant_path = index_dir / "qdrant"
-        query_trace = None
-        objective_background = ""
-        if query_mode == "grounded":
-            plan = build_grounded_query_plan(
-                query,
-                llm=self._get_llm(),
-                max_results_per_query=self.config.max_search_results,
-            )
-            query_trace = plan_to_trace(plan)
-            objective_background = plan.transform.objective_background
-            result = retrieve_parents_for_queries(
-                query,
-                plan.transform.retrieval_queries,
-                author=author,
-                index_dir=index_dir,
-                qdrant_path=qdrant_path,
-                encoder=self._get_encoder(),
-                child_top_k=self.config.child_top_k,
-                per_query_parent_k=self.config.per_query_parent_k,
-                parent_top_k=parent_top_k,
-            )
-        elif query_mode == "raw":
-            result = retrieve_parents(
-                query,
-                author=author,
-                index_dir=index_dir,
-                qdrant_path=qdrant_path,
-                encoder=self._get_encoder(),
-                child_top_k=self.config.child_top_k,
-                parent_top_k=parent_top_k,
-            )
-        else:
-            raise ValueError(f"Unknown query_mode: {query_mode}")
-        return result, query_trace, objective_background
 
     def _get_encoder(self) -> TextEncoder:
         if self._encoder is None:
@@ -253,6 +478,211 @@ class PersonaChatService:
         if self._llm is None:
             self._llm = DeepSeekJsonClient.from_env()
         return self._llm
+
+    def _write_trace(
+        self,
+        prepared: PreparedChat,
+        *,
+        status: str,
+        answer: str | None = None,
+        error: Exception | None = None,
+    ) -> Path:
+        payload = {
+            "schema_version": TRACE_SCHEMA_VERSION,
+            "trace_id": prepared.trace_id,
+            "status": status,
+            "created_at": prepared.trace_created_at,
+            "updated_at": utc_now(),
+            "input": {
+                "author": prepared.author,
+                "session_id": prepared.session_id,
+                "query": prepared.query,
+                "query_mode": prepared.query_mode,
+                "writer_prompt": prepared.writer_prompt,
+                "retrieval_parameters": {
+                    "child_top_k": self.config.child_top_k,
+                    "per_query_parent_k": self.config.per_query_parent_k,
+                    "parent_top_k": prepared.retrieve_result.parent_top_k,
+                },
+            },
+            "capture": {"mode": prepared.trace_capture, "retention": self.config.trace_retention},
+            "stages": self._finalized_stages(prepared, status=status, answer=answer, error=error),
+            "query_understanding": {
+                "duration_ms": prepared.query_understanding_duration_ms,
+                "trace": prepared.query_trace,
+                "objective_background": prepared.objective_background,
+            },
+            "retrieval": serialize_retrieve_result(prepared.retrieve_result, prepared.retrieval_duration_ms),
+            "writer": {
+                "variant": prepared.writer_prompt,
+                "duration_ms": prepared.writer_build_duration_ms,
+                "context_parents": [
+                    {"rank": hit.rank, "parent_id": hit.parent_id, "title": hit.title}
+                    for hit in prepared.retrieve_result.parents
+                ],
+                "messages": [
+                    {"role": message.get("role", ""), "characters": len(message.get("content", ""))}
+                    for message in prepared.messages
+                ],
+                "total_characters": sum(len(message.get("content", "")) for message in prepared.messages),
+            },
+            "generation": {
+                "provider": type(self._get_llm()).__name__ if self._llm is not None else "DeepSeekJsonClient",
+                "model": str(getattr(self._llm, "model", "")) if self._llm is not None else "",
+                "temperature": self.config.temperature,
+                "max_tokens": self.config.max_tokens,
+                "duration_ms": prepared.generation_duration_ms,
+                "time_to_first_token_ms": prepared.generation_ttft_ms,
+                "usage": prepared.generation_usage,
+                "answer_characters": len(answer) if answer is not None else 0,
+            },
+            "timing": {"total_duration_ms": elapsed_ms(prepared.trace_started_at)},
+        }
+        if error is not None:
+            payload["error"] = trace_error(error)
+        if prepared.trace_capture == "full":
+            payload["writer"]["full_messages"] = prepared.messages
+            payload["retrieval"]["full_parent_context"] = [
+                {"rank": hit.rank, "parent_id": hit.parent_id, "parent": hit.parent}
+                for hit in prepared.retrieve_result.parents
+            ]
+        return write_trace(
+            self.config.data_dir,
+            prepared.author,
+            prepared.trace_id,
+            payload,
+            retention=self.config.trace_retention,
+        )
+
+    def _write_prepare_failure_trace(
+        self,
+        *,
+        author: str,
+        session_id: str,
+        trace_id: str,
+        created_at: str,
+        query: str,
+        query_mode: str,
+        writer_prompt: str,
+        parent_top_k: int,
+        error: Exception,
+    ) -> Path:
+        payload = {
+            "schema_version": TRACE_SCHEMA_VERSION,
+            "trace_id": trace_id,
+            "status": "failed",
+            "created_at": created_at,
+            "updated_at": utc_now(),
+            "input": {
+                "author": author,
+                "session_id": session_id,
+                "query": query,
+                "query_mode": query_mode,
+                "writer_prompt": writer_prompt,
+                "retrieval_parameters": {"parent_top_k": parent_top_k},
+            },
+            "query_understanding": None,
+            "capture": {"mode": "summary", "retention": self.config.trace_retention},
+            "stages": [],
+            "retrieval": None,
+            "writer": None,
+            "generation": None,
+            "error": trace_error(error),
+        }
+        return write_trace(
+            self.config.data_dir,
+            author,
+            trace_id,
+            payload,
+            retention=self.config.trace_retention,
+        )
+
+    def _stage(
+        self,
+        stage_id: str,
+        label: str,
+        started_at: float,
+        *,
+        status: str = "completed",
+        details: dict[str, Any] | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return new_stage(
+            stage_id=stage_id,
+            label=label,
+            started_at=0.0,
+            duration_ms=elapsed_ms(started_at),
+            status=status,
+            details=details,
+            usage=usage,
+        )
+
+    def _usage_or_estimate(self, llm: Any, *texts: str) -> dict[str, Any]:
+        return provider_usage(getattr(llm, "last_usage", None)) or estimated_usage_for_text(*texts)
+
+    def _retrieval_stages(self, result: RetrieveResult, started_at: float) -> list[dict[str, Any]]:
+        timing = result.timing
+        stages: list[dict[str, Any]] = []
+        for key, duration_ms in timing.items():
+            if key.endswith(":embedding") or key == "embedding":
+                label = "编码检索问题"
+            elif key.endswith(":dense") or key == "dense":
+                label = "Dense 向量召回"
+            elif key.endswith(":sparse") or key == "sparse":
+                label = "Sparse 关键词召回"
+            elif key.endswith("parent_rrf") or key == "parent_aggregation":
+                label = "Parent RRF 聚合"
+            elif key == "parent_load":
+                label = "加载最终 Parent 全文"
+            else:
+                label = key
+            stages.append(
+                new_stage(
+                    stage_id=f"retrieval:{key}",
+                    label=label,
+                    started_at=0.0,
+                    duration_ms=duration_ms,
+                    details={"metric": key},
+                )
+            )
+        return stages
+
+    def _finalized_stages(
+        self,
+        prepared: PreparedChat,
+        *,
+        status: str,
+        answer: str | None,
+        error: Exception | None,
+    ) -> list[dict[str, Any]]:
+        stages = list(prepared.stages or [])
+        if prepared.generation_started_at is not None:
+            generation_status = "failed" if error is not None else "completed" if status == "completed" else "running"
+            details: dict[str, Any] = {
+                "time_to_first_token_ms": prepared.generation_ttft_ms,
+                "answer_characters": len(answer or ""),
+            }
+            if prepared.generation_duration_ms > 0 and answer is not None:
+                details["characters_per_second"] = round(len(answer) / (prepared.generation_duration_ms / 1000), 1)
+            if error is not None:
+                details["error"] = trace_error(error)
+            stages.append(
+                new_stage(
+                    stage_id="generation",
+                    label="流式生成回答",
+                    started_at=0.0,
+                    duration_ms=prepared.generation_duration_ms,
+                    status=generation_status,
+                    details=details,
+                    usage=prepared.generation_usage,
+                )
+            )
+        offset_ms = 0
+        for index, stage in enumerate(stages, start=1):
+            stage["order"] = index
+            stage["started_offset_ms"] = offset_ms
+            offset_ms += int(stage.get("duration_ms") or 0)
+        return stages
 
 
 def list_local_personas(data_dir: Path = Path("data")) -> list[LocalPersona]:
@@ -304,6 +734,50 @@ def sources_from_parent_hits(parent_hits: list[ParentHit]) -> list[dict[str, Any
     ]
 
 
+def serialize_retrieve_result(result: RetrieveResult, duration_ms: int) -> dict[str, Any]:
+    return {
+        "duration_ms": duration_ms,
+        "timing": result.timing,
+        "query": result.query,
+        "collection_name": result.collection_name,
+        "child_top_k": result.child_top_k,
+        "parent_top_k": result.parent_top_k,
+        "retrieval_queries": [
+            {"route": item.route, "query": item.query}
+            for item in result.retrieval_queries
+        ],
+        "routes": {
+            route: [serialize_child_hit(hit) for hit in hits]
+            for route, hits in result.routes.items()
+        },
+        "parents": [serialize_parent_hit(hit) for hit in result.parents],
+    }
+
+
+def serialize_child_hit(hit: Any) -> dict[str, Any]:
+    return {
+        "rank": hit.rank,
+        "score": hit.score,
+        "node_id": hit.node_id,
+        "parent_id": hit.parent_id,
+        "node_type": hit.node_type,
+        "title": hit.title,
+        "path": hit.path,
+        "route": hit.route,
+    }
+
+
+def serialize_parent_hit(hit: ParentHit) -> dict[str, Any]:
+    return {
+        "rank": hit.rank,
+        "score": hit.score,
+        "parent_id": hit.parent_id,
+        "title": hit.title,
+        "path": hit.path,
+        "first_hits": [serialize_child_hit(child) for child in hit.first_hits],
+    }
+
+
 def load_persona_profile(author_dir: Path) -> dict[str, Any]:
     for path in [author_dir / "profile.json", author_dir / "raw" / "profile.json"]:
         if path.exists():
@@ -346,6 +820,17 @@ def session_title(query: str) -> str:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def elapsed_ms(started_at: float) -> int:
+    return round((perf_counter() - started_at) * 1000)
+
+
+def trace_error(error: Exception) -> dict[str, str]:
+    return {
+        "type": type(error).__name__,
+        "message": str(error)[:1000],
+    }
 
 
 def read_json(path: Path) -> dict[str, Any]:

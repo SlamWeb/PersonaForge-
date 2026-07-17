@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Protocol
+from typing import Callable, Iterator, Protocol
 
 from personaforge.env import first_env_value, load_env_file
 
@@ -45,12 +45,33 @@ class JsonChatClient(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class LlmUsage:
+    """Provider-reported usage for one completion request."""
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    prompt_cache_hit_tokens: int | None = None
+    prompt_cache_miss_tokens: int | None = None
+
+    def as_dict(self) -> dict[str, int | None]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "prompt_cache_hit_tokens": self.prompt_cache_hit_tokens,
+            "prompt_cache_miss_tokens": self.prompt_cache_miss_tokens,
+        }
+
+
+@dataclass(slots=True)
 class DeepSeekJsonClient:
     api_key: str
     base_url: str = DEFAULT_DEEPSEEK_BASE_URL
     model: str = DEFAULT_DEEPSEEK_MODEL
     timeout_seconds: float = 90.0
     thinking: str | None = "disabled"
+    last_usage: LlmUsage | None = None
 
     @classmethod
     def from_env(cls, env_file: Path = Path(".env")) -> "DeepSeekJsonClient":
@@ -103,6 +124,7 @@ class DeepSeekJsonClient:
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout_seconds=self.timeout_seconds,
         )
+        self.last_usage = _usage_from_payload(payload)
         try:
             text = str(payload["choices"][0]["message"]["content"]).strip()
         except (KeyError, IndexError, TypeError) as exc:
@@ -116,20 +138,41 @@ class DeepSeekJsonClient:
         temperature: float = 0.7,
         max_tokens: int = 2048,
     ) -> Iterator[str]:
+        yield from self.stream_text_with_usage(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    def stream_text_with_usage(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        on_usage: Callable[[LlmUsage], None] | None = None,
+    ) -> Iterator[str]:
         body: dict[str, object] = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if self.thinking:
             body["thinking"] = {"type": self.thinking}
+        def receive_usage(usage: LlmUsage) -> None:
+            self.last_usage = usage
+            if on_usage is not None:
+                on_usage(usage)
+
         yield from _post_json_stream(
             _chat_endpoint(self.base_url),
             body,
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout_seconds=self.timeout_seconds,
+            on_usage=receive_usage,
         )
 
 
@@ -180,6 +223,7 @@ def _post_json_stream(
     *,
     headers: dict[str, str] | None = None,
     timeout_seconds: float = 90.0,
+    on_usage: Callable[[LlmUsage], None] | None = None,
 ) -> Iterator[str]:
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     request_headers = {
@@ -200,6 +244,9 @@ def _post_json_stream(
                     payload = json.loads(data_part)
                 except json.JSONDecodeError:
                     continue
+                usage = _usage_from_payload(payload)
+                if usage is not None and on_usage is not None:
+                    on_usage(usage)
                 text = _stream_delta_text(payload)
                 if text:
                     yield text
@@ -222,6 +269,24 @@ def _stream_delta_text(payload: dict[str, object]) -> str:
         return str(delta.get("content") or "")
     except (KeyError, TypeError):
         return ""
+
+
+def _usage_from_payload(payload: dict[str, object]) -> LlmUsage | None:
+    raw_usage = payload.get("usage")
+    if not isinstance(raw_usage, dict):
+        return None
+
+    def as_int(key: str) -> int | None:
+        value = raw_usage.get(key)
+        return int(value) if isinstance(value, int | float) else None
+
+    return LlmUsage(
+        prompt_tokens=as_int("prompt_tokens"),
+        completion_tokens=as_int("completion_tokens"),
+        total_tokens=as_int("total_tokens"),
+        prompt_cache_hit_tokens=as_int("prompt_cache_hit_tokens"),
+        prompt_cache_miss_tokens=as_int("prompt_cache_miss_tokens"),
+    )
 
 
 def _chat_endpoint(base_url: str) -> str:

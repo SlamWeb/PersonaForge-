@@ -113,6 +113,9 @@ data/authors/zhihu/<author>/index/
 event: meta
 data: {"author":"...","retrieval_queries":[...]}
 
+event: status
+data: {"stage":"retrieval","label":"正在检索历史表达"}
+
 event: token
 data: {"text":"..."}
 
@@ -126,6 +129,16 @@ data: {"answer":"...","sources":[...]}
 event: error
 data: {"error":"..."}
 ```
+
+### `GET /api/personas/{author}/traces/{trace_id}`
+
+返回某次 assistant 回答对应的 trace v0。trace 是本地运行档案，路径为：
+
+```text
+data/authors/zhihu/<author>/traces/<trace_id>.json
+```
+
+它包含输入与运行配置、query understanding 和联网背景、每一路 dense/sparse child 检索、parent RRF 聚合、writer 输入摘要、耗时和最终状态。它不保存 API key、cookie、登录态，也默认不重复保存完整 writer prompt 与 parent 正文。
 
 ## 流式策略
 
@@ -217,6 +230,101 @@ data/authors/zhihu/<author>/sessions/<session_id>.json
 ```
 
 会话只负责产品层历史记录，不改变当前 writer 的上下文策略。也就是说，继续同一个会话时，当前生成链路仍以“当前问题 + RAG 材料”为主；长期记忆和多轮上下文注入留到后续 developer mode / memory 模块。
+
+assistant 消息额外保存 `trace_id`。这样历史会话里的任意一轮生成也可以打开对应运行过程。
+
+## Trace v0
+
+Web 负责产生统一的 trace v0，而不是复用 CLI 的一次性 `--trace-path` 输出。每次 Web 回答有一个稳定的 `trace_id`：
+
+```text
+prepare_chat
+-> 写入 status=prepared 的 trace
+-> SSE meta 返回 trace_id
+-> stream_answer
+-> 写入 status=completed 或 failed 的 trace
+```
+
+Trace 结构按阶段分组：
+
+- `input`：问题、persona、会话、query mode、writer variant、检索参数。
+- `query_understanding`：路由、搜索词、来源、客观背景、4 路 retrieval query。
+- `retrieval`：每一路 child hit 与最终 parent 聚合；只保存 parent 元数据和命中节点，不保存 parent 正文副本。
+- `writer`：模板 variant、参与上下文的 parent 标题/ID、消息角色及长度。
+- `generation`：provider 名称、temperature、max tokens、耗时、输出字符数、状态和错误。
+
+前端第一版不做独立评测后台。每条作者回答下面放一个低干扰的“查看过程”入口，打开后按阶段展示 trace；技术细节默认折叠。完整 prompt 临时预览、judge/rewrite trace 与跨运行对比属于后续阶段。
+
+### 实时运行状态
+
+回答开始前不能只显示省略号。后端在真正进入每个阶段前通过 SSE `status` 事件通知前端，普通界面只显示面向用户的客观动作，不展示模型推理过程：
+
+```text
+正在理解问题
+正在查询相关背景       # 仅 Search Planner 判断确实需要 Tavily 时出现
+正在整理检索线索
+正在检索历史表达
+正在准备回答
+已完成检索，正在生成回答
+```
+
+等待状态使用独立于正式回答的作者行，带低干扰文字流光动画，不使用转圈加载器，也不显示实时秒数。首个生成 token 到达时，状态行消失，正式作者回答另起一行。回答完成后不保留普通用户可见的阶段摘要，只保留“查看过程”入口。
+
+若 Tavily 失败，系统应记录错误到 trace，并展示“未获得额外背景，继续检索作者历史表达”，随后以无联网背景的链路继续回答；不能因为辅助背景服务失败而直接终止整题。
+
+## Trace v1
+
+Trace v1 是 Web 运行记录的统一事实来源。它不是模型思维链，也不保存 API Key、cookie 或登录态；它记录的是可复核的系统节点、输入输出摘要、资源消耗和降级结果。
+
+```text
+Search Planner
+-> 可选 Tavily
+-> Query Transform
+-> Embedding
+-> Dense / Sparse 召回
+-> Parent RRF
+-> Writer 上下文组装
+-> 流式生成
+```
+
+每个节点有稳定字段：
+
+```json
+{
+  "id": "generation",
+  "label": "流式生成回答",
+  "status": "completed",
+  "order": 7,
+  "started_offset_ms": 0,
+  "duration_ms": 5690,
+  "details": {},
+  "usage": {
+    "source": "provider",
+    "prompt_tokens": 16813,
+    "completion_tokens": 345,
+    "total_tokens": 17158
+  }
+}
+```
+
+### Token 规则
+
+- DeepSeek 的非流式和流式调用优先读取接口返回的 `usage`。
+- 流式调用启用 `stream_options.include_usage`，记录输入、输出、总 token 和缓存命中/未命中 token。
+- 没有 usage 的 provider 只能保存显式标注的 `estimated` 估算；前端不得把它显示成真实用量。
+- 生成记录额外包含 `time_to_first_token_ms`、总耗时、输出字符数；不记录逐 token 的内部时间线。
+
+### 保存等级与留存
+
+- 默认 `summary`：保存 query、联网背景、检索路线、最终 Parent 元数据、writer 长度和节点指标；不重复写入完整 Parent 正文或完整 prompt。
+- 开发者模式可以选择 `full`：仅保存在用户本机的 trace 中，额外保存 writer 完整 messages 和最终 Parent 全文，供后续 Judge、人工评审或可复现实验使用。
+- 每位作者的普通 Web trace 最多保留 200 条，超过后删除最旧记录。`data/eval/` 下的评测产物不归这条规则管理，保持不可变。
+
+### Web 展示与后续评测
+
+- Trace 始终生成；开发者模式只控制“查看过程”入口和完整记录开关，不影响回答质量。
+- 开发者抽屉按节点时间线展示阶段、耗时、token 来源、降级或错误，child hit 仍然折叠。
+- 未来的 LLM-as-Judge、人工打分和 rewrite 不能覆盖原 trace；它们应以 `trace_id` 引用这次运行，并把评分、标注与派生回答放进独立评测记录。
 
 ## 建议问题
 

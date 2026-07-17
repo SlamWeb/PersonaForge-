@@ -21,7 +21,7 @@ from personaforge.web.schemas import (
     SuggestionsResponse,
     SessionsResponse,
 )
-from personaforge.web.service import PersonaChatService, WebConfig, sources_from_parent_hits
+from personaforge.web.service import ChatProgress, PreparedChat, PersonaChatService, WebConfig, sources_from_parent_hits
 from personaforge.web.streaming import sse_event
 
 
@@ -79,6 +79,15 @@ def create_app(config: WebConfig | None = None, *, service: PersonaChatService |
         service.delete_session(author, session_id)
         return {"status": "ok"}
 
+    @app.get("/api/personas/{author}/traces/{trace_id}", response_model=None)
+    def trace(author: str, trace_id: str) -> dict[str, Any] | JSONResponse:
+        try:
+            return service.get_trace(author, trace_id)
+        except FileNotFoundError:
+            return JSONResponse({"error": "Trace not found"}, status_code=404)
+        except ValueError:
+            return JSONResponse({"error": "Trace is invalid"}, status_code=400)
+
     @app.post("/api/chat/stream")
     def chat_stream(request: ChatStreamRequest) -> StreamingResponse:
         return StreamingResponse(
@@ -108,19 +117,28 @@ def create_app(config: WebConfig | None = None, *, service: PersonaChatService |
 
 def _chat_stream_events(service: PersonaChatService, request: ChatStreamRequest) -> Iterator[str]:
     answer_parts: list[str] = []
+    prepared: PreparedChat | None = None
     try:
-        prepared = service.prepare_chat(
+        for item in service.iter_prepare_chat(
             author=request.author,
             session_id=request.session_id,
             query=request.query,
             query_mode=request.query_mode,
             writer_prompt=request.writer_prompt,
             parent_top_k=request.parent_top_k,
-        )
+            trace_capture=request.trace_capture,
+        ):
+            if isinstance(item, ChatProgress):
+                yield sse_event("status", {"stage": item.stage, "label": item.label})
+                continue
+            prepared = item
+        if prepared is None:  # pragma: no cover - defensive invariant.
+            raise RuntimeError("Chat preparation finished without a prepared request.")
         yield sse_event(
             "meta",
             {
                 "session_id": prepared.session_id,
+                "trace_id": prepared.trace_id,
                 "author": prepared.author,
                 "query_mode": prepared.query_mode,
                 "writer_prompt": prepared.writer_prompt,
@@ -132,21 +150,26 @@ def _chat_stream_events(service: PersonaChatService, request: ChatStreamRequest)
                 ],
             },
         )
+        yield sse_event("status", {"stage": "generation", "label": "已完成检索，正在生成回答"})
         for token in service.stream_answer(prepared):
             answer_parts.append(token)
             yield sse_event("token", {"text": token})
         answer = "".join(answer_parts)
         sources = sources_from_parent_hits(prepared.retrieve_result.parents)
         service.save_turn(prepared, answer, sources)
+        service.complete_trace(prepared, answer)
         yield sse_event(
             "done",
             {
                 "session_id": prepared.session_id,
+                "trace_id": prepared.trace_id,
                 "answer": answer,
                 "sources": sources,
             },
         )
     except Exception as exc:  # pragma: no cover - API boundary safety net.
+        if prepared is not None:
+            service.fail_trace(prepared, exc)
         yield sse_event(
             "error",
             {

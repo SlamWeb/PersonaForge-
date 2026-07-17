@@ -35,6 +35,7 @@ class ChatMessage(BaseModel):
     role: Literal["user", "assistant", "error"]
     text: str
     sources: list[dict] | None = None
+    trace_id: str | None = None
 
 
 class ChatSession(BaseModel):
@@ -61,3 +62,4 @@ class ChatStreamRequest(BaseModel):
     query_mode: Literal["raw", "grounded"] = "grounded"
     writer_prompt: Literal["current", "strong_identity"] = "strong_identity"
     parent_top_k: int = Field(default=20, ge=1, le=40)
+    trace_capture: Literal["summary", "full"] = "summary"

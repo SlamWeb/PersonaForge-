@@ -369,7 +369,65 @@ DeepSeek stream
 -> React fetch ReadableStream
 ```
 
-trace 时间线和评估面板放到 MVP 后的下一阶段。
+每次回答生成本地 trace 档案；普通聊天界面只提供轻量“查看过程”入口，复杂的 trace 时间线和评估面板放到下一阶段。
+
+## 13.1 Trace v0
+
+Trace v0 是一次生成运行的结构化本地档案，不是零散终端日志。它服务于三件事：定位回答失败原因、为离线评估保留可复盘证据、为 Web 开发者模式提供数据。
+
+每次 Web 回答对应一个 `trace_id`，写入：
+
+```text
+data/authors/zhihu/<author>/traces/<trace_id>.json
+```
+
+trace v0 记录：
+
+- 输入问题、会话 ID、query mode、writer prompt variant 和检索参数。
+- query understanding / Tavily grounding 的判断、搜索词、客观背景和 query transform 结果。
+- 每一路 dense/sparse child 命中、最终 parent RRF 聚合结果及其命中来源。
+- writer 的模板版本、上下文 parent 摘要、消息角色与长度统计；默认不重复保存完整 writer prompt 和 parent 正文。
+- 模型名称、各阶段耗时、输出长度、完成或失败状态与错误信息。
+
+trace 不记录 API key、cookie、登录态。会话的 assistant 消息仅保存 `trace_id`，让历史对话也能回到对应运行过程。
+
+第一版 API：
+
+```text
+GET /api/personas/{author}/traces/{trace_id}
+```
+
+Web 在每条作者回答下提供低干扰的“查看过程”入口。普通用户只需看来源；开发者可展开看到理解、检索、聚合、writer 配置和耗时。离线 eval 后续复用相同 trace schema，而不是另起一份不兼容格式。
+
+## 13.2 离线评测 v0
+
+离线评测与正常 Web 知识库分开：Web 继续使用全量索引；eval 不重建索引，而是在每一路 Qdrant 检索中动态排除 holdout 之后的全部 parent。
+
+第一版固定为严格时间切分：
+
+```text
+较早内容 -> train（可被检索）
+接下来的 10 个合格 answer -> dev
+最后的 20 个合格 answer -> test
+```
+
+合格 answer 必须有原问题标题、创建时间和至少 200 个字符正文。cutoff 从 dev 的第一条开始；所有时间不早于 cutoff 的 answer/article/pin 都进入排除名单，保证评测时不会用未来表达回答过去未知的问题。
+
+第一版命令：
+
+```powershell
+pf eval prepare <author> --dev-size 10 --test-size 20
+pf eval run <author> --dataset data/eval/<dataset>/dataset.jsonl --split dev --run-name baseline
+```
+
+每次 run 写入 `data/eval/<dataset>/runs/<run-name>/`，包含：
+
+- `manifest.json`：数据集 hash、排除名单 hash、git revision、所有模型和检索参数。
+- `runs.jsonl`：每题生成答案、query understanding、检索摘要和 trace。
+- `items/01.md` 等：供人工阅读与填写评分。
+- `summary.md`：本次运行的可读摘要。
+
+v0 不接 LLM Judge，也不做 rewrite。开发期只跑 dev；只有候选方案稳定后才跑冻结的 test。每题开发期生成一次，最终候选再做 3 次重复并报告波动。
 
 ## 14. 安全与开源边界
 

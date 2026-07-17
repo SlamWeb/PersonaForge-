@@ -32,12 +32,14 @@ export type ChatStreamRequest = {
   query_mode: 'raw' | 'grounded';
   writer_prompt: 'current' | 'strong_identity';
   parent_top_k: number;
+  trace_capture: 'summary' | 'full';
 };
 
 export type ChatMessage = {
   role: 'user' | 'assistant' | 'error';
   text: string;
   sources?: Source[] | null;
+  trace_id?: string | null;
 };
 
 export type ChatSessionSummary = {
@@ -60,9 +62,106 @@ export type ChatSession = {
 
 export type ChatCallbacks = {
   onMeta?: (payload: Record<string, unknown>) => void;
+  onStatus?: (payload: { stage: string; label: string }) => void;
   onToken?: (text: string) => void;
-  onDone?: (payload: { session_id: string; answer: string; sources: Source[] }) => void;
+  onDone?: (payload: { session_id: string; trace_id?: string; answer: string; sources: Source[] }) => void;
   onError?: (message: string) => void;
+};
+
+export type TraceChildHit = {
+  rank: number;
+  score: number;
+  node_id: string;
+  parent_id: string;
+  node_type: string;
+  title: string;
+  path: string;
+  route: string;
+};
+
+export type TraceParent = {
+  rank: number;
+  score: number;
+  parent_id: string;
+  title: string;
+  path: string;
+  first_hits: TraceChildHit[];
+};
+
+export type TracePayload = {
+  trace_id: string;
+  status: 'prepared' | 'completed' | 'failed';
+  created_at: string;
+  updated_at: string;
+  capture?: { mode: 'summary' | 'full'; retention: number };
+  stages?: TraceStage[];
+  input: {
+    author: string;
+    session_id: string;
+    query: string;
+    query_mode: string;
+    writer_prompt: string;
+    retrieval_parameters: Record<string, number>;
+  };
+  query_understanding: {
+    duration_ms: number;
+    trace: {
+      search_plan?: { needs_web?: boolean; search_queries?: string[] };
+      search_results?: Array<{ query: string; title: string; url: string }>;
+      retrieval_queries?: Array<{ route: string; query: string }>;
+    } | null;
+    objective_background: string;
+  } | null;
+  retrieval: {
+    duration_ms: number;
+    timing?: Record<string, number>;
+    collection_name: string;
+    retrieval_queries: Array<{ route: string; query: string }>;
+    routes: Record<string, TraceChildHit[]>;
+    parents: TraceParent[];
+  } | null;
+  writer: {
+    variant: string;
+    duration_ms: number;
+    context_parents: Array<{ rank: number; parent_id: string; title: string }>;
+    messages: Array<{ role: string; characters: number }>;
+    total_characters: number;
+  } | null;
+  generation: {
+    provider: string;
+    model: string;
+    temperature: number;
+    max_tokens: number;
+    duration_ms: number;
+    time_to_first_token_ms?: number | null;
+    usage?: TraceUsage | null;
+    answer_characters: number;
+  } | null;
+  timing?: { total_duration_ms: number };
+  error?: { type: string; message: string };
+};
+
+export type TraceUsage = {
+  source: 'provider' | 'estimated';
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  total_tokens?: number | null;
+  prompt_cache_hit_tokens?: number | null;
+  prompt_cache_miss_tokens?: number | null;
+  estimated_tokens?: number;
+  characters?: number;
+  note?: string;
+};
+
+export type TraceStage = {
+  id: string;
+  label: string;
+  status: 'completed' | 'fallback' | 'failed' | 'running';
+  order: number;
+  started_offset_ms: number;
+  duration_ms: number;
+  details?: Record<string, unknown>;
+  usage?: TraceUsage | null;
 };
 
 export async function fetchPersonas(): Promise<{ personas: PersonaInfo[]; default_author?: string }> {
@@ -111,6 +210,16 @@ export async function deleteSession(author: string, sessionId: string): Promise<
   }
 }
 
+export async function fetchTrace(author: string, traceId: string): Promise<TracePayload> {
+  const response = await fetch(
+    `/api/personas/${encodeURIComponent(author)}/traces/${encodeURIComponent(traceId)}`
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to load trace: ${response.status}`);
+  }
+  return response.json();
+}
+
 export async function streamChat(request: ChatStreamRequest, callbacks: ChatCallbacks): Promise<void> {
   const response = await fetch('/api/chat/stream', {
     method: 'POST',
@@ -153,6 +262,7 @@ function dispatchSse(raw: string, callbacks: ChatCallbacks): void {
   if (!event || !data) return;
   const payload = JSON.parse(data);
   if (event === 'meta') callbacks.onMeta?.(payload);
+  if (event === 'status') callbacks.onStatus?.({ stage: String(payload.stage || ''), label: String(payload.label || '') });
   if (event === 'token') callbacks.onToken?.(String(payload.text || ''));
   if (event === 'done') callbacks.onDone?.(payload);
   if (event === 'error') callbacks.onError?.(String(payload.error || 'Unknown error'));

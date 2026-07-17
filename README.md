@@ -77,6 +77,17 @@ Then open:
 http://127.0.0.1:8000/
 ```
 
+## Offline Evaluation
+
+PersonaForge can prepare a strict temporal holdout without rebuilding the local index. It keeps the newest valid answers out of retrieval, including all later articles and pins, then dynamically excludes those parent IDs in every dense/sparse query.
+
+```powershell
+pf eval prepare <author>
+pf eval run <author> --dataset data/eval/<dataset>/dataset.jsonl --split dev --run-name baseline
+```
+
+For a low-cost smoke run, add `--limit 1`. Each run writes a local manifest, machine-readable `runs.jsonl`, and one Markdown review file per question under `data/eval/`. Evaluation outputs are intentionally ignored by git. LLM judging and rewrite loops are a later stage; v0 starts with reproducible generation and human review.
+
 ## Current Decisions
 
 - MVP is a local CLI + local Web app, not a hosted crawler service.

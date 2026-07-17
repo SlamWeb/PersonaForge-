@@ -192,7 +192,6 @@ def plan_to_trace(plan: GroundedQueryPlan) -> dict[str, object]:
                 "query": item.query,
                 "title": item.title,
                 "url": item.url,
-                "content": item.content,
             }
             for item in plan.search_results
         ],

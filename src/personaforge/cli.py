@@ -192,6 +192,48 @@ def build_parser() -> argparse.ArgumentParser:
     suggest_parser.add_argument("--count", type=int, default=6, help="Number of suggestions to keep.")
     suggest_parser.add_argument("--source-limit", type=int, default=80, help="Number of history titles to send to the LLM.")
 
+    eval_parser = subparsers.add_parser("eval", help="Prepare and run leak-safe temporal evaluation.")
+    eval_subparsers = eval_parser.add_subparsers(dest="eval_command", required=True)
+
+    eval_prepare_parser = eval_subparsers.add_parser("prepare", help="Build temporal dev/test holdouts from parents.jsonl.")
+    eval_prepare_parser.add_argument("author", help="Creator token.")
+    eval_prepare_parser.add_argument("--index-dir", help="Directory containing parents.jsonl.")
+    eval_prepare_parser.add_argument("--out-dir", help="Output dataset directory under data/eval by default.")
+    eval_prepare_parser.add_argument("--dev-size", type=int, default=10)
+    eval_prepare_parser.add_argument("--test-size", type=int, default=20)
+    eval_prepare_parser.add_argument("--min-answer-characters", type=int, default=200)
+
+    eval_run_parser = eval_subparsers.add_parser("run", help="Generate answers for one prepared eval split.")
+    eval_run_parser.add_argument("author", help="Creator token.")
+    eval_run_parser.add_argument("--dataset", required=True, help="Path to dataset.jsonl from pf eval prepare.")
+    eval_run_parser.add_argument("--index-dir", help="Directory containing parents.jsonl and nodes.jsonl.")
+    eval_run_parser.add_argument("--qdrant-path", help="Local Qdrant storage path.")
+    eval_run_parser.add_argument("--out-dir", help="Dataset directory. Defaults to the dataset parent directory.")
+    eval_run_parser.add_argument("--run-name", required=True, help="Unique local name for this experiment run.")
+    eval_run_parser.add_argument("--split", choices=["dev", "test"], default="dev")
+    eval_run_parser.add_argument("--limit", type=int, help="Optional item limit for smoke testing.")
+    eval_run_parser.add_argument("--model-name", default="BAAI/bge-m3", help="Embedding model name.")
+    eval_run_parser.add_argument(
+        "--embedding-device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device for query embedding.",
+    )
+    eval_run_parser.add_argument("--child-top-k", type=int, default=100)
+    eval_run_parser.add_argument("--per-query-parent-k", type=int, default=30)
+    eval_run_parser.add_argument("--parent-top-k", type=int, default=20)
+    eval_run_parser.add_argument("--query-mode", choices=["raw", "grounded"], default="grounded")
+    eval_run_parser.add_argument("--max-search-results", type=int, default=5)
+    eval_run_parser.add_argument("--temperature", type=float, default=0.85)
+    eval_run_parser.add_argument("--max-tokens", type=int, default=1600)
+    eval_run_parser.add_argument(
+        "--writer-prompt",
+        choices=WRITER_PROMPT_CHOICES,
+        default="strong_identity",
+        help="Writer prompt variant. Eval defaults to the current strong identity baseline.",
+    )
+    eval_run_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
+
     web_parser = subparsers.add_parser("web", help="Start the local Web UI.")
     web_parser.add_argument("author", nargs="?", help="Creator token.")
     web_parser.add_argument("--port", type=int, default=8000)
@@ -268,6 +310,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "suggest":
         return _run_suggest(args)
+
+    if args.command == "eval":
+        return _run_eval(args)
 
     if args.command == "web":
         return _run_web(args)
@@ -584,6 +629,73 @@ def _run_suggest(args: argparse.Namespace) -> int:
         print(f"{idx}. {item}")
     print(f"Wrote: {result.path}")
     return 0
+
+
+def _run_eval(args: argparse.Namespace) -> int:
+    if args.eval_command == "prepare":
+        from personaforge.eval.dataset import prepare_temporal_dataset
+
+        index_dir = Path(args.index_dir) if args.index_dir else Path("data/authors") / "zhihu" / args.author / "index"
+        out_dir = (
+            Path(args.out_dir)
+            if args.out_dir
+            else Path("data/eval") / f"{args.author}-temporal-dev{args.dev_size}-test{args.test_size}"
+        )
+        result = prepare_temporal_dataset(
+            author=args.author,
+            index_dir=index_dir,
+            out_dir=out_dir,
+            dev_size=args.dev_size,
+            test_size=args.test_size,
+            min_answer_characters=args.min_answer_characters,
+        )
+        print(f"Prepared temporal dataset for {args.author}:")
+        print(f"- dev/test: {result.dev_count}/{result.test_count}")
+        print(f"- cutoff: {result.cutoff}")
+        print(f"- excluded parent docs: {result.excluded_parent_count}")
+        print(f"- dataset: {result.dataset_path}")
+        print(f"- manifest: {result.manifest_path}")
+        return 0
+
+    if args.eval_command == "run":
+        from personaforge.eval.runner import EvalRunConfig, run_temporal_eval
+
+        dataset_path = Path(args.dataset)
+        index_dir = Path(args.index_dir) if args.index_dir else Path("data/authors") / "zhihu" / args.author / "index"
+        qdrant_path = Path(args.qdrant_path) if args.qdrant_path else index_dir / "qdrant"
+        out_dir = Path(args.out_dir) if args.out_dir else dataset_path.parent
+        config = EvalRunConfig(
+            author=args.author,
+            dataset_path=dataset_path,
+            split=args.split,
+            run_name=args.run_name,
+            out_dir=out_dir,
+            query_mode=args.query_mode,
+            writer_prompt=args.writer_prompt,
+            child_top_k=args.child_top_k,
+            per_query_parent_k=args.per_query_parent_k,
+            parent_top_k=args.parent_top_k,
+            max_search_results=args.max_search_results,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            limit=args.limit,
+        )
+        encoder = BgeM3Encoder(args.model_name, device=args.embedding_device, use_fp16=not args.no_fp16)
+        result = run_temporal_eval(
+            config,
+            index_dir=index_dir,
+            qdrant_path=qdrant_path,
+            encoder=encoder,
+            llm=DeepSeekJsonClient.from_env(),
+        )
+        print(f"Completed {result.item_count} {args.split} eval item(s):")
+        print(f"- run: {result.run_dir}")
+        print(f"- manifest: {result.manifest_path}")
+        print(f"- results: {result.runs_path}")
+        print(f"- summary: {result.summary_path}")
+        return 0
+
+    raise ValueError(f"Unknown eval command: {args.eval_command}")
 
 
 def _write_retrieve_trace(path: Path, *, query_trace: dict | None, result) -> None:
